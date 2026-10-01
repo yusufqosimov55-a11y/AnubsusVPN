@@ -41,25 +41,16 @@ dp = Dispatcher()
 
 # Put your own images here later. If a file does not exist, the bot sends text only.
 IMAGES = {
+    "home": BASE_DIR / "IMG_3880.jpeg",        # Главное меню
+    "tariffs": BASE_DIR / "IMG_3879.jpeg",     # Тарифы
+    "cabinet": BASE_DIR / "IMG_3885.jpeg",     # Профиль
+    "support": BASE_DIR / "IMG_3878.jpeg",     # Техподдержка
+    "vpn": BASE_DIR / "IMG_3883.jpeg",         # Подключиться
 
-    "home": BASE_DIR / "IMG_3878.jpeg",
-
-    "tariffs": BASE_DIR / "IMG_3879.jpeg",
-
-    "cabinet": BASE_DIR / "IMG_3880.jpeg",
-
-    "support": BASE_DIR / "IMG_3883.jpeg",
-
-    "vpn": BASE_DIR / "IMG_3885.jpeg",
-
-    # Пока используем существующие изображения
-
-    "referral": BASE_DIR / "IMG_3883.jpeg",
-
-    "proxy": BASE_DIR / "IMG_3883.jpeg",
-
-    "instructions": BASE_DIR / "IMG_3885.jpeg",
-
+    # Пока используем существующие фото
+    "referral": BASE_DIR / "IMG_3878.jpeg",
+    "proxy": BASE_DIR / "IMG_3879.jpeg",
+    "instructions": BASE_DIR / "IMG_3883.jpeg",
 }
 
 # ----------------------------- Temporary demo data -----------------------------
