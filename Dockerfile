@@ -13,4 +13,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Команда запуска вашего бота (если файл называется main.py)
-CMD ["python", "main.py"]
+CMD ["python", "main.ru"]
