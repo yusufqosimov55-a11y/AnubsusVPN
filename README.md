@@ -1,2 +1,0 @@
-# AnubsusVPN
-Vpn
