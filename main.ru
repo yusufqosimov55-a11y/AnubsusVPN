@@ -1,227 +1,586 @@
 import asyncio
 import logging
-import sys
-import structlog
-import redis.asyncio as redis
-from datetime import datetime
+import os
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
-from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, TelegramObject
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy import BigInt, String, DateTime
+# ============================================================
+# Telegram VPN bot — UI/logic skeleton
+# VPN API, payments and production DB are intentionally separated
+# so they can be connected later without rebuilding the menu.
+# ============================================================
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("vpn_bot")
 
-# ==========================================
-# 1. НАСТРОЙКИ (Конфигурация)
-# ==========================================
-class Settings(BaseSettings):
-    BOT_TOKEN: str = "ВАШ_ТОКЕН_БОТА"
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/anobsus_vpn"
-    REDIS_URL: str = "redis://localhost:6379/0"
-    ADMIN_IDS: str = "111111111"
-    WELCOME_IMAGE_URL: str = ""
+BASE_DIR = Path(__file__).resolve().parent
+ASSETS = BASE_DIR / "assets"
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 
-settings = Settings()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
 
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+dp = Dispatcher()
 
-# ==========================================
-# 2. БАЗА ДАННЫХ И МОДЕЛИ
-# ==========================================
-class Base(DeclarativeBase):
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+# ----------------------------- UI assets -----------------------------
 
-class User(Base):
-    __tablename__ = "users"
+# Put your own images here later. If a file does not exist, the bot sends text only.
+IMAGES = {
+    "home": ASSETS / "home.jpg",
+    "tariffs": ASSETS / "tariffs.jpg",
+    "cabinet": ASSETS / "cabinet.jpg",
+    "support": ASSETS / "support.jpg",
+    "vpn": ASSETS / "vpn.jpg",
+    "referral": ASSETS / "referral.jpg",
+    "proxy": ASSETS / "proxy.jpg",
+    "instructions": ASSETS / "instructions.jpg",
+}
 
-    id: Mapped[int] = mapped_column(BigInt, primary_key=True, autoincrement=False)
-    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    first_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    language_code: Mapped[str | None] = mapped_column(String(10), nullable=True, default="ru")
-    status: Mapped[str] = mapped_column(String(50), nullable=False, default="active")
-    last_activity: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+# ----------------------------- Temporary demo data -----------------------------
+# This is deliberately simple for the first stage.
+# Tomorrow this can be replaced by PostgreSQL + VPN API without changing the UI.
 
-engine = create_async_engine(settings.DATABASE_URL, echo=False, pool_pre_ping=True)
-async_session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-
-# ==========================================
-# 3. РЕПОЗИТОРИЙ ПОЛЬЗОВАТЕЛЕЙ
-# ==========================================
-class UserRepository:
-    def __init__(self, session: AsyncSession):
-        self.session = session
-
-    async def upsert_user(self, user_id: int, username: str | None, first_name: str, language_code: str | None) -> User:
-        stmt = insert(User).values(
-            id=user_id,
-            username=username,
-            first_name=first_name,
-            language_code=language_code,
-            status="active",
-            last_activity=datetime.utcnow(),
-        ).on_conflict_do_update(
-            index_elements=["id"],
-            set_={
-                "username": username,
-                "first_name": first_name,
-                "language_code": language_code,
-                "last_activity": datetime.utcnow(),
-            },
-        ).returning(User)
-
-        result = await self.session.execute(stmt)
-        await self.session.commit()
-        return result.scalar_one()
+demo_users: dict[int, dict] = {}
 
 
-# ==========================================
-# 4. КЛАВИАТУРЫ
-# ==========================================
-def get_main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🟢 Подключиться")],
-            [KeyboardButton(text="📱 Прокси Telegram")],
-            [KeyboardButton(text="👤 Кабинет"), KeyboardButton(text="🎁 Демо")],
-            [KeyboardButton(text="💳 VPN Тарифы"), KeyboardButton(text="📞 Техподдержка")],
-            [KeyboardButton(text="📢 Наши новости ↗")],
-        ],
-        resize_keyboard=True,
+def user_data(user_id: int) -> dict:
+    return demo_users.setdefault(
+        user_id,
+        {
+            "subscription_until": None,
+            "devices": 0,
+            "referrals": 0,
+            "balance": 0,
+            "trial_used": False,
+        },
     )
 
 
-# ==========================================
-# 5. ЗАЩИТА ОТ СПАМА (Rate Limit Middleware)
-# ==========================================
-class RateLimitMiddleware(BaseMiddleware):
-    def __init__(self, redis_client: redis.Redis, limit: int = 5, period: int = 2):
-        self.redis = redis_client
-        self.limit = limit
-        self.period = period
+def subscription_text(user_id: int) -> str:
+    data = user_data(user_id)
+    until = data["subscription_until"]
 
-    async def __call__(self, handler, event: TelegramObject, data: dict):
-        if not isinstance(event, Message) or not event.from_user:
-            return await handler(event, data)
+    if not until:
+        return "🔴 <b>Подписка:</b> не активна"
 
-        user_id = event.from_user.id
-        key = f"ratelimit:{user_id}"
+    if until <= datetime.now(timezone.utc):
+        return "🔴 <b>Подписка:</b> закончилась"
 
-        current = await self.redis.get(key)
-        if current and int(current) >= self.limit:
-            await event.answer("⚠️ Слишком много запросов. Подождите немного.")
-            return
-
-        pipe = self.redis.pipeline()
-        pipe.incr(key, 1)
-        if not current:
-            pipe.expire(key, self.period)
-        await pipe.execute()
-
-        return await handler(event, data)
+    left = until - datetime.now(timezone.utc)
+    days = left.days
+    hours = left.seconds // 3600
+    return (
+        f"🟢 <b>Подписка:</b> активна\n"
+        f"⏳ Осталось: <b>{days} дн. {hours} ч.</b>\n"
+        f"📅 До: <b>{until.strftime('%d.%m.%Y %H:%M')}</b>"
+    )
 
 
-# ==========================================
-# 6. РОУТЕРЫ И ОБРАБОТЧИКИ (Handlers)
-# ==========================================
-router = Router()
+# ----------------------------- Keyboards -----------------------------
 
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    async with async_session_maker() as session:
-        user_repo = UserRepository(session)
-        await user_repo.upsert_user(
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-            language_code=message.from_user.language_code,
+def back_kb(target: str = "home") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="↩️ Назад", callback_data=target)]
+        ]
+    )
+
+
+def home_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔐 Подключить VPN", callback_data="vpn"),
+                InlineKeyboardButton(text="💳 Тарифы", callback_data="tariffs"),
+            ],
+            [
+                InlineKeyboardButton(text="👤 Личный кабинет", callback_data="cabinet"),
+                InlineKeyboardButton(text="🌍 Серверы", callback_data="servers"),
+            ],
+            [
+                InlineKeyboardButton(text="🎁 Пробный период", callback_data="trial"),
+                InlineKeyboardButton(text="👥 Пригласить друга", callback_data="referral"),
+            ],
+            [
+                InlineKeyboardButton(text="🛠 Поддержка", callback_data="support"),
+                InlineKeyboardButton(text="📚 Помощь", callback_data="help"),
+            ],
+            [InlineKeyboardButton(text="📢 Новости", callback_data="news")],
+        ]
+    )
+
+
+def vpn_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🟢 Получить доступ", callback_data="get_access")],
+            [InlineKeyboardButton(text="📱 Мои устройства", callback_data="devices")],
+            [InlineKeyboardButton(text="🌍 Выбрать сервер", callback_data="servers")],
+            [InlineKeyboardButton(text="📖 Как подключиться", callback_data="instructions")],
+            [InlineKeyboardButton(text="🔄 Обновить доступ", callback_data="renew")],
+            [InlineKeyboardButton(text="↩️ В меню", callback_data="home")],
+        ]
+    )
+
+
+def tariffs_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="7 дней", callback_data="buy_7"),
+                InlineKeyboardButton(text="1 месяц", callback_data="buy_30"),
+            ],
+            [
+                InlineKeyboardButton(text="3 месяца", callback_data="buy_90"),
+                InlineKeyboardButton(text="1 год", callback_data="buy_365"),
+            ],
+            [InlineKeyboardButton(text="🎟 Ввести промокод", callback_data="promo")],
+            [InlineKeyboardButton(text="↩️ В меню", callback_data="home")],
+        ]
+    )
+
+
+def cabinet_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔐 Мой VPN", callback_data="vpn")],
+            [InlineKeyboardButton(text="💳 Купить / продлить", callback_data="tariffs")],
+            [InlineKeyboardButton(text="📱 Устройства", callback_data="devices")],
+            [InlineKeyboardButton(text="💰 Платежи", callback_data="payments")],
+            [InlineKeyboardButton(text="↩️ В меню", callback_data="home")],
+        ]
+    )
+
+
+def support_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔑 Не подключается VPN", callback_data="support_connect")],
+            [InlineKeyboardButton(text="💳 Проблема с оплатой", callback_data="support_payment")],
+            [InlineKeyboardButton(text="📱 Проблема с устройством", callback_data="support_device")],
+            [InlineKeyboardButton(text="💬 Написать оператору", callback_data="support_operator")],
+            [InlineKeyboardButton(text="↩️ В меню", callback_data="home")],
+        ]
+    )
+
+
+# ----------------------------- Message helpers -----------------------------
+
+async def show_screen(
+    message: Message,
+    *,
+    key: str,
+    text: str,
+    keyboard: InlineKeyboardMarkup | None = None,
+) -> None:
+    image = IMAGES.get(key)
+    if image and image.exists():
+        await message.answer_photo(
+            photo=FSInputFile(image),
+            caption=text,
+            reply_markup=keyboard,
         )
-
-    text = (
-        "🔐 **AnobsusVPN**\n\n"
-        "Добро пожаловать!\n\n"
-        "Быстрое и защищённое подключение к интернету без лишних сложностей.\n\n"
-        "⚡ Высокая скорость\n"
-        "🛡 Надёжная защита\n"
-        "🌍 Глобальный доступ\n"
-        "🔒 Конфиденциальность\n\n"
-        "Выберите действие ниже:"
-    )
-
-    if settings.WELCOME_IMAGE_URL:
-        await message.answer_photo(photo=settings.WELCOME_IMAGE_URL, caption=text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
     else:
-        await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+        await message.answer(text, reply_markup=keyboard)
 
 
-@router.callback_query(F.data == "main_menu")
-async def cb_main_menu(callback: CallbackQuery):
-    await callback.message.answer("Главное меню:", reply_markup=get_main_keyboard())
+async def edit_screen(
+    callback: CallbackQuery,
+    *,
+    key: str,
+    text: str,
+    keyboard: InlineKeyboardMarkup | None = None,
+) -> None:
+    # Telegram cannot turn an existing text message into a photo message.
+    # For the first version we delete the old message and send the new screen.
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    await show_screen(callback.message, key=key, text=text, keyboard=keyboard)
     await callback.answer()
 
 
-# ==========================================
-# 7. ДИСПЕТЧЕР
-# ==========================================
-def get_dispatcher(redis_client: redis.Redis) -> Dispatcher:
-    dp = Dispatcher()
-    dp.message.middleware(RateLimitMiddleware(redis_client))
-    dp.include_router(router)
-    return dp
+# ----------------------------- Screens -----------------------------
+
+HOME_TEXT = """
+<b>🚀 Добро пожаловать!</b>
+
+Быстрый и удобный VPN для повседневного использования.
+
+🔒 Защищённое соединение
+⚡ Стабильные серверы
+📱 Поддержка нескольких устройств
+🛠 Помощь прямо в Telegram
+
+Выберите нужный раздел ниже:
+"""
+
+VPN_TEXT = """
+<b>🔐 Мой VPN</b>
+
+{status}
+
+Здесь можно получить доступ, посмотреть устройства,
+выбрать сервер или открыть инструкцию по подключению.
+
+<i>Сейчас работает демонстрационный режим.
+Реальный VPN API подключим следующим этапом.</i>
+"""
+
+TARIFFS_TEXT = """
+<b>💳 Тарифы</b>
+
+Выберите срок подписки:
+
+🟢 7 дней — тестовый вариант
+🔵 1 месяц — стандартный тариф
+🟣 3 месяца — длительный доступ
+🟠 1 год — годовая подписка
+
+Стоимость и платёжную систему можно изменить
+в одном месте конфигурации.
+"""
+
+CABINET_TEXT = """
+<b>👤 Личный кабинет</b>
+
+🆔 ID: <code>{user_id}</code>
+{status}
+
+📱 Устройства: <b>{devices}</b>
+🎁 Приглашено друзей: <b>{referrals}</b>
+💰 Баланс: <b>{balance} сум</b>
+"""
+
+SUPPORT_TEXT = """
+<b>🛠 Поддержка</b>
+
+Опишите проблему или выберите подходящий раздел.
+Не отправляйте пароль, токены или платёжные данные.
+
+Среднее время ответа оператора зависит от нагрузки.
+"""
+
+HELP_TEXT = """
+<b>📚 Помощь</b>
+
+<b>Как подключиться?</b>
+1. Откройте «Мой VPN».
+2. Получите доступ.
+3. Выберите сервер.
+4. Установите приложение по инструкции.
+5. Импортируйте конфигурацию.
+
+Если что-то не работает — откройте «Поддержка».
+"""
+
+SERVERS_TEXT = """
+<b>🌍 Серверы</b>
+
+Доступные направления:
+
+🇩🇪 Германия — подготовка
+🇳🇱 Нидерланды — подготовка
+🇫🇮 Финляндия — подготовка
+
+После подключения реального VPN API статус
+серверов будет показываться автоматически.
+"""
+
+REFERRAL_TEXT = """
+<b>👥 Партнёрская программа</b>
+
+Приглашайте друзей по своей ссылке.
+
+🔗 Ваша ссылка:
+<code>https://t.me/ВАШ_БОТ?start=ref_{user_id}</code>
+
+🎁 Условия и бонусы можно настроить после подключения
+платежей и реальной системы подписок.
+"""
+
+PROXY_TEXT = """
+<b>🌐 Telegram Proxy</b>
+
+Здесь можно будет получить актуальные параметры
+прокси для Telegram.
+
+Пока раздел работает как интерфейс-заглушка.
+"""
+
+INSTRUCTIONS_TEXT = """
+<b>📖 Подключение VPN</b>
+
+1️⃣ Установите поддерживаемое VPN-приложение.
+2️⃣ Получите конфигурацию в разделе «Мой VPN».
+3️⃣ Импортируйте её в приложение.
+4️⃣ Включите соединение.
+5️⃣ Проверьте статус.
+
+После подключения VPN API сюда можно добавить
+автоматическую выдачу конфигурации.
+"""
 
 
-# ==========================================
-# 8. ЗАПУСК БОТА
-# ==========================================
-def setup_logging():
-    logging.basicConfig(format="%(message)s", stream=sys.stdout, level=logging.INFO)
-    structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.add_log_level,
-            structlog.processors.StackInfoRenderer(),
-            structlog.dev.set_exc_info,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.JSONRenderer(),
-        ],
-        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-        context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
-        cache_logger_on_first_use=True,
+# ----------------------------- Handlers -----------------------------
+
+@dp.message(CommandStart())
+async def start(message: Message) -> None:
+    user_data(message.from_user.id)
+    await show_screen(
+        message,
+        key="home",
+        text=HOME_TEXT,
+        keyboard=home_kb(),
     )
 
 
-async def main():
-    setup_logging()
-    logger = structlog.get_logger()
+@dp.callback_query(F.data == "home")
+async def home(callback: CallbackQuery) -> None:
+    await edit_screen(callback, key="home", text=HOME_TEXT, keyboard=home_kb())
 
-    logger.info("starting_bot_initialization")
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+@dp.callback_query(F.data == "vpn")
+async def vpn(callback: CallbackQuery) -> None:
+    text = VPN_TEXT.format(status=subscription_text(callback.from_user.id))
+    await edit_screen(callback, key="vpn", text=text, keyboard=vpn_kb())
 
-    redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
-    bot = Bot(token=settings.BOT_TOKEN)
-    dp = get_dispatcher(redis_client)
 
-    try:
-        logger.info("bot_started_polling")
-        await dp.start_polling(bot, session_maker=None)
-    finally:
-        await redis_client.close()
-        await bot.session.close()
-        await engine.dispose()
+@dp.callback_query(F.data == "tariffs")
+async def tariffs(callback: CallbackQuery) -> None:
+    await edit_screen(callback, key="tariffs", text=TARIFFS_TEXT, keyboard=tariffs_kb())
+
+
+@dp.callback_query(F.data == "cabinet")
+async def cabinet(callback: CallbackQuery) -> None:
+    data = user_data(callback.from_user.id)
+    text = CABINET_TEXT.format(
+        user_id=callback.from_user.id,
+        status=subscription_text(callback.from_user.id),
+        devices=data["devices"],
+        referrals=data["referrals"],
+        balance=data["balance"],
+    )
+    await edit_screen(callback, key="cabinet", text=text, keyboard=cabinet_kb())
+
+
+@dp.callback_query(F.data == "support")
+async def support(callback: CallbackQuery) -> None:
+    await edit_screen(callback, key="support", text=SUPPORT_TEXT, keyboard=support_kb())
+
+
+@dp.callback_query(F.data == "help")
+async def help_screen(callback: CallbackQuery) -> None:
+    await edit_screen(callback, key="instructions", text=HELP_TEXT, keyboard=back_kb())
+
+
+@dp.callback_query(F.data == "servers")
+async def servers(callback: CallbackQuery) -> None:
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🇩🇪 Германия", callback_data="server_de")],
+            [InlineKeyboardButton(text="🇳🇱 Нидерланды", callback_data="server_nl")],
+            [InlineKeyboardButton(text="🇫🇮 Финляндия", callback_data="server_fi")],
+            [InlineKeyboardButton(text="↩️ В меню", callback_data="home")],
+        ]
+    )
+    await edit_screen(callback, key="vpn", text=SERVERS_TEXT, keyboard=kb)
+
+
+@dp.callback_query(F.data.startswith("server_"))
+async def server_selected(callback: CallbackQuery) -> None:
+    code = callback.data.split("_", 1)[1]
+    names = {"de": "🇩🇪 Германия", "nl": "🇳🇱 Нидерланды", "fi": "🇫🇮 Финляндия"}
+    name = names.get(code, "Неизвестный сервер")
+    text = (
+        f"<b>{name}</b>\n\n"
+        "🟡 Сервер пока не подключён к VPN API.\n\n"
+        "Когда инфраструктура будет готова, здесь будут "
+        "реальный статус, нагрузка, пинг и кнопка выбора."
+    )
+    await edit_screen(callback, key="vpn", text=text, keyboard=back_kb("servers"))
+
+
+@dp.callback_query(F.data == "referral")
+async def referral(callback: CallbackQuery) -> None:
+    text = REFERRAL_TEXT.format(user_id=callback.from_user.id)
+    await edit_screen(callback, key="referral", text=text, keyboard=back_kb())
+
+
+@dp.callback_query(F.data == "proxy")
+async def proxy(callback: CallbackQuery) -> None:
+    await edit_screen(callback, key="proxy", text=PROXY_TEXT, keyboard=back_kb())
+
+
+@dp.callback_query(F.data == "instructions")
+async def instructions(callback: CallbackQuery) -> None:
+    await edit_screen(callback, key="instructions", text=INSTRUCTIONS_TEXT, keyboard=back_kb("vpn"))
+
+
+@dp.callback_query(F.data == "devices")
+async def devices(callback: CallbackQuery) -> None:
+    data = user_data(callback.from_user.id)
+    text = (
+        "<b>📱 Мои устройства</b>\n\n"
+        f"Подключено: <b>{data['devices']}</b>\n\n"
+        "Лимит устройств будет зависеть от тарифа. "
+        "После подключения VPN API здесь появится управление "
+        "активными устройствами."
+    )
+    await edit_screen(callback, key="cabinet", text=text, keyboard=back_kb("cabinet"))
+
+
+@dp.callback_query(F.data == "payments")
+async def payments(callback: CallbackQuery) -> None:
+    text = (
+        "<b>💰 История платежей</b>\n\n"
+        "Пока платежей нет.\n\n"
+        "После подключения платёжной системы здесь будут "
+        "дата, сумма, тариф и статус каждой операции."
+    )
+    await edit_screen(callback, key="cabinet", text=text, keyboard=back_kb("cabinet"))
+
+
+@dp.callback_query(F.data == "trial")
+async def trial(callback: CallbackQuery) -> None:
+    data = user_data(callback.from_user.id)
+    if data["trial_used"]:
+        text = "<b>🎁 Пробный период</b>\n\nВы уже использовали пробный период."
+    else:
+        text = (
+            "<b>🎁 Пробный период</b>\n\n"
+            "В демонстрационном режиме пробный доступ не выдаётся.\n"
+            "После подключения VPN API здесь будет автоматическая выдача."
+        )
+    await edit_screen(callback, key="vpn", text=text, keyboard=back_kb())
+
+
+@dp.callback_query(F.data == "get_access")
+async def get_access(callback: CallbackQuery) -> None:
+    await edit_screen(
+        callback,
+        key="vpn",
+        text=(
+            "<b>🔐 Получение доступа</b>\n\n"
+            "Сейчас VPN API ещё не подключён.\n\n"
+            "На следующем этапе эта кнопка будет создавать "
+            "персональный VPN-доступ и отправлять конфигурацию пользователю."
+        ),
+        keyboard=back_kb("vpn"),
+    )
+
+
+@dp.callback_query(F.data == "renew")
+async def renew(callback: CallbackQuery) -> None:
+    await edit_screen(callback, key="tariffs", text=TARIFFS_TEXT, keyboard=tariffs_kb())
+
+
+@dp.callback_query(F.data.startswith("buy_"))
+async def buy_tariff(callback: CallbackQuery) -> None:
+    period = callback.data.split("_", 1)[1]
+    labels = {"7": "7 дней", "30": "1 месяц", "90": "3 месяца", "365": "1 год"}
+    label = labels.get(period, period)
+
+    await edit_screen(
+        callback,
+        key="tariffs",
+        text=(
+            f"<b>💳 Выбран тариф: {label}</b>\n\n"
+            "Платёжная система пока не подключена.\n\n"
+            "На следующем этапе здесь будет реальная оплата, "
+            "проверка платежа и автоматическая активация подписки."
+        ),
+        keyboard=back_kb("tariffs"),
+    )
+
+
+@dp.callback_query(F.data == "promo")
+async def promo(callback: CallbackQuery) -> None:
+    await edit_screen(
+        callback,
+        key="tariffs",
+        text=(
+            "<b>🎟 Промокод</b>\n\n"
+            "Отправьте промокод отдельным сообщением.\n"
+            "Проверка промокодов подключится вместе с базой данных."
+        ),
+        keyboard=back_kb("tariffs"),
+    )
+
+
+@dp.callback_query(F.data == "news")
+async def news(callback: CallbackQuery) -> None:
+    await edit_screen(
+        callback,
+        key="home",
+        text=(
+            "<b>📢 Новости</b>\n\n"
+            "Здесь будут последние новости сервиса, "
+            "обслуживание серверов и важные уведомления."
+        ),
+        keyboard=back_kb(),
+    )
+
+
+@dp.callback_query(F.data.startswith("support_"))
+async def support_topic(callback: CallbackQuery) -> None:
+    topic = callback.data.replace("support_", "")
+    titles = {
+        "connect": "🔑 Не подключается VPN",
+        "payment": "💳 Проблема с оплатой",
+        "device": "📱 Проблема с устройством",
+        "operator": "💬 Оператор",
+    }
+    title = titles.get(topic, "Поддержка")
+
+    if topic == "operator":
+        text = (
+            "<b>💬 Оператор</b>\n\n"
+            "В рабочей версии здесь будет кнопка для обращения "
+            "в поддержку или пересылка сообщения администратору."
+        )
+    else:
+        text = (
+            f"<b>{title}</b>\n\n"
+            "Опишите проблему одним сообщением.\n"
+            "В рабочей версии обращение будет сохранено в БД "
+            "и передано оператору."
+        )
+
+    await edit_screen(callback, key="support", text=text, keyboard=back_kb("support"))
+
+
+# ----------------------------- Fallback -----------------------------
+
+@dp.message()
+async def fallback(message: Message) -> None:
+    await message.answer(
+        "Используйте кнопки меню ниже или отправьте /start.",
+        reply_markup=home_kb(),
+    )
+
+
+async def main() -> None:
+    log.info("VPN bot started")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("Bot stopped!")
+    asyncio.run(main())
