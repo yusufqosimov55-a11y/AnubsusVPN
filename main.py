@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import ssl
+import secrets
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from decimal import Decimal
@@ -14,7 +15,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, func, select
+import aiohttp
+
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -38,15 +41,31 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# ----------------------------- Pricing -----------------------------
-# Prices are displayed and stored in USD.
-BALANCE_CURRENCY = "USD"
-TARIFF_PRICES = {
+# ----------------------------- TON payment configuration -----------------------------
+TON_WALLET_ADDRESS = os.getenv(
+    "TON_WALLET_ADDRESS",
+    "UQC1Gh5ZO6r0-_qBOAyWJ1AXuyEzs169ld0D-PJGrCVQ_d3D",
+).strip()
+TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "").strip()
+TON_PRICE_REFRESH_SECONDS = 300  # 5 minutes
+TON_ORDER_TTL_SECONDS = 15 * 60
+TON_API_BASE = "https://toncenter.com/api/v3"
+COINGECKO_PRICE_URL = (
+    "https://api.coingecko.com/api/v3/simple/price"
+    "?ids=the-open-network&vs_currencies=usd&precision=full"
+)
+
+TARIFF_PRICES_USD = {
     7: Decimal("1.00"),
     30: Decimal("3.00"),
     90: Decimal("7.50"),
     365: Decimal("25.00"),
 }
+
+TON_USD_PRICE: Decimal | None = None
+TON_PRICE_UPDATED_AT: datetime | None = None
+TON_PRICE_LOCK = asyncio.Lock()
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -113,16 +132,16 @@ class Subscription(Base):
 class Payment(Base):
     __tablename__ = "payments"
 
-    # Payment amounts are currently denominated in USD.
-
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0, nullable=False)
-    currency: Mapped[str] = mapped_column(String(16), default="USD", nullable=False)
+    currency: Mapped[str] = mapped_column(String(16), default="UZS", nullable=False)
     method: Mapped[str | None] = mapped_column(String(64), nullable=True)
     provider: Mapped[str | None] = mapped_column(String(128), nullable=True)
     transaction_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    order_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     tariff_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -185,6 +204,292 @@ async def init_db() -> None:
     """
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+
+        # Existing Neon databases need these small additive migrations.
+        await connection.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS order_id VARCHAR(64)"))
+        await connection.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ"))
+        await connection.execute(text("ALTER TABLE payments ALTER COLUMN amount TYPE NUMERIC(24, 9)"))
+        await connection.execute(
+            text("CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_order_id ON payments(order_id) WHERE order_id IS NOT NULL")
+        )
+
+
+# ----------------------------- TON payment helpers -----------------------------
+
+
+def format_ton(value: Decimal) -> str:
+    return f"{Decimal(value):.9f}".rstrip("0").rstrip(".")
+
+
+def tariff_price_usd(days: int) -> Decimal | None:
+    return TARIFF_PRICES_USD.get(days)
+
+
+async def fetch_ton_usd_price() -> Decimal:
+    headers = {"accept": "application/json"}
+    if COINGECKO_API_KEY:
+        headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as http:
+        async with http.get(COINGECKO_PRICE_URL) as response:
+            response.raise_for_status()
+            data = await response.json()
+
+    raw_price = data.get("the-open-network", {}).get("usd")
+    if raw_price is None:
+        raise RuntimeError("CoinGecko did not return TON/USD price")
+
+    price = Decimal(str(raw_price))
+    if price <= 0:
+        raise RuntimeError("Invalid TON/USD price")
+    return price
+
+
+async def refresh_ton_price(force: bool = False) -> Decimal | None:
+    global TON_USD_PRICE, TON_PRICE_UPDATED_AT
+
+    async with TON_PRICE_LOCK:
+        now = utc_now()
+        if (
+            not force
+            and TON_USD_PRICE is not None
+            and TON_PRICE_UPDATED_AT is not None
+            and (now - TON_PRICE_UPDATED_AT).total_seconds() < TON_PRICE_REFRESH_SECONDS
+        ):
+            return TON_USD_PRICE
+
+        try:
+            price = await fetch_ton_usd_price()
+        except Exception:
+            log.exception("Failed to refresh TON/USD price")
+            return TON_USD_PRICE
+
+        TON_USD_PRICE = price
+        TON_PRICE_UPDATED_AT = now
+        log.info("TON/USD price updated: %s", price)
+        return price
+
+
+async def ton_price_loop() -> None:
+    while True:
+        try:
+            await refresh_ton_price(force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("TON price refresh loop failed")
+        await asyncio.sleep(TON_PRICE_REFRESH_SECONDS)
+
+
+async def create_ton_payment(telegram_id: int, tariff_days: int) -> Payment | None:
+    price_usd = tariff_price_usd(tariff_days)
+    if price_usd is None:
+        return None
+
+    ton_price = await refresh_ton_price()
+    if ton_price is None:
+        return None
+
+    base_amount = (price_usd / ton_price).quantize(Decimal("0.000000001"))
+    now = utc_now()
+    expires_at = now + timedelta(seconds=TON_ORDER_TTL_SECONDS)
+    order_id = "TON-" + secrets.token_hex(5).upper()
+
+    async with SessionLocal() as session:
+        user = await get_user(session, telegram_id)
+        if user is None:
+            return None
+
+        result = await session.execute(
+            select(Payment.amount).where(
+                Payment.currency == "TON",
+                Payment.status == "pending",
+                Payment.expires_at > now,
+            )
+        )
+        used_amounts = {Decimal(str(row[0])) for row in result.all()}
+
+        # A tiny nanotons offset makes simultaneous orders distinguishable.
+        for _ in range(20):
+            offset = Decimal(secrets.randbelow(999) + 1) / Decimal("1000000000")
+            amount = (base_amount + offset).quantize(Decimal("0.000000001"))
+            if amount not in used_amounts:
+                break
+        else:
+            return None
+
+        payment = Payment(
+            user_id=user.id,
+            amount=amount,
+            currency="TON",
+            method="TON",
+            provider="TON Center + CoinGecko",
+            order_id=order_id,
+            tariff_days=tariff_days,
+            status="pending",
+            expires_at=expires_at,
+        )
+        session.add(payment)
+        await session.commit()
+        await session.refresh(payment)
+        return payment
+
+
+def ton_payment_kb(payment_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💎 Я оплатил", callback_data=f"ton_check_{payment_id}")],
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="tariffs")],
+        ]
+    )
+
+
+def extract_message_text(message_content: dict | None) -> str:
+    if not isinstance(message_content, dict):
+        return ""
+    decoded = message_content.get("decoded")
+    if isinstance(decoded, dict):
+        for key in ("text", "comment", "value"):
+            value = decoded.get(key)
+            if isinstance(value, str):
+                return value.strip()
+    return ""
+
+
+async def find_ton_transaction(payment: Payment) -> str | None:
+    if not payment.expires_at:
+        return None
+
+    start_utime = int(payment.created_at.timestamp()) - 30
+    end_utime = int(min(payment.expires_at, utc_now()).timestamp()) + 30
+    params = {
+        "account": TON_WALLET_ADDRESS,
+        "start_utime": start_utime,
+        "end_utime": end_utime,
+        "limit": 100,
+        "sort": "desc",
+    }
+    headers = {"accept": "application/json"}
+    if TONCENTER_API_KEY:
+        headers["X-API-Key"] = TONCENTER_API_KEY
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as http:
+        async with http.get(f"{TON_API_BASE}/transactions", params=params) as response:
+            response.raise_for_status()
+            data = await response.json()
+
+    expected_nanotons = int(Decimal(payment.amount) * Decimal("1000000000"))
+
+    async with SessionLocal() as session:
+        for tx in data.get("transactions", []):
+            tx_hash = tx.get("hash")
+            in_msg = tx.get("in_msg") or {}
+            try:
+                value = int(in_msg.get("value"))
+            except (TypeError, ValueError):
+                continue
+
+            if value != expected_nanotons:
+                continue
+
+            # TON Center was queried for our receiving account, so the
+            # transaction is already scoped to this wallet. If decoded text
+            # is available, require our order ID when a comment is present.
+            content_text = extract_message_text(in_msg.get("message_content"))
+            if content_text and payment.order_id and payment.order_id not in content_text:
+                continue
+
+            used = await session.execute(
+                select(Payment.id).where(
+                    Payment.transaction_id == tx_hash,
+                    Payment.status == "paid",
+                ).limit(1)
+            )
+            if used.scalar_one_or_none() is not None:
+                continue
+
+            return tx_hash
+
+    return None
+
+
+async def confirm_ton_payment(payment_id: int, telegram_id: int) -> tuple[bool, str]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Payment).where(Payment.id == payment_id).with_for_update()
+        )
+        payment = result.scalar_one_or_none()
+        if payment is None or payment.currency != "TON":
+            return False, "Платёж не найден."
+
+        user = await session.get(User, payment.user_id)
+        if user is None or user.telegram_id != telegram_id:
+            return False, "Платёж не принадлежит вашему аккаунту."
+
+        if payment.status == "paid":
+            return True, "Платёж уже подтверждён."
+
+        if payment.expires_at and payment.expires_at < utc_now():
+            payment.status = "expired"
+            await session.commit()
+            return False, "Срок действия заказа истёк. Создайте новый заказ."
+
+        found_hash = await find_ton_transaction(payment)
+        if not found_hash:
+            return False, "❌ Транзакция не найдена. Проверьте перевод и попробуйте ещё раз через несколько секунд."
+
+        duplicate = await session.execute(
+            select(Payment.id).where(
+                Payment.transaction_id == found_hash,
+                Payment.status == "paid",
+                Payment.id != payment_id,
+            ).limit(1)
+        )
+        if duplicate.scalar_one_or_none() is not None:
+            return False, "Эта транзакция уже была использована для другого заказа."
+
+        now = utc_now()
+        payment.transaction_id = found_hash
+        payment.status = "paid"
+        payment.paid_at = now
+
+        # Activate/extend subscription in the same DB transaction as payment
+        # confirmation, so one transaction cannot grant days twice.
+        sub_result = await session.execute(
+            select(Subscription)
+            .where(
+                Subscription.user_id == user.id,
+                Subscription.status == "active",
+            )
+            .order_by(Subscription.expires_at.desc())
+            .limit(1)
+            .with_for_update()
+        )
+        subscription = sub_result.scalar_one_or_none()
+        days = int(payment.tariff_days or 0)
+
+        if subscription and subscription.expires_at > now:
+            subscription.expires_at = subscription.expires_at + timedelta(days=days)
+            subscription.updated_at = now
+        elif subscription:
+            subscription.expires_at = now + timedelta(days=days)
+            subscription.status = "active"
+            subscription.updated_at = now
+        else:
+            session.add(
+                Subscription(
+                    user_id=user.id,
+                    expires_at=now + timedelta(days=days),
+                    status="active",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+        await session.commit()
+        return True, "✅ Оплата подтверждена! Подписка активирована."
 
 
 # ----------------------------- UI assets -----------------------------
@@ -444,12 +749,12 @@ def tariffs_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="7 дней — $1.00", callback_data="buy_7"),
-                InlineKeyboardButton(text="1 месяц — $3.00", callback_data="buy_30"),
+                InlineKeyboardButton(text="7 дней", callback_data="buy_7"),
+                InlineKeyboardButton(text="1 месяц", callback_data="buy_30"),
             ],
             [
-                InlineKeyboardButton(text="3 месяца — $7.50", callback_data="buy_90"),
-                InlineKeyboardButton(text="1 год — $25.00", callback_data="buy_365"),
+                InlineKeyboardButton(text="3 месяца", callback_data="buy_90"),
+                InlineKeyboardButton(text="1 год", callback_data="buy_365"),
             ],
             [InlineKeyboardButton(text="🎟 Ввести промокод", callback_data="promo")],
             [InlineKeyboardButton(text="↩️ В меню", callback_data="home")],
@@ -590,8 +895,8 @@ TARIFFS_TEXT = """
 🟣 3 месяца — <b>$7.50</b>
 🟠 1 год — <b>$25.00</b>
 
-Цены указаны в долларах США.
-Выберите срок подписки ниже.
+Оплата сейчас доступна в TON.
+Курс TON/USD автоматически обновляется каждые 5 минут.
 """
 
 CABINET_TEXT = """
@@ -602,7 +907,7 @@ CABINET_TEXT = """
 
 📱 Устройства: <b>{devices}</b>
 🎁 Приглашено друзей: <b>{referrals}</b>
-💰 Баланс: <b>${balance}</b>
+💰 Баланс: <b>{balance} сум</b>
 """
 
 SUPPORT_TEXT = """
@@ -827,8 +1132,12 @@ async def payments(callback: CallbackQuery) -> None:
         for payment in rows:
             date_text = payment.created_at.strftime("%d.%m.%Y %H:%M")
             status_text = "✅ Оплачен" if payment.status == "paid" else "⏳ Ожидает"
+            if payment.currency == "TON":
+                amount_text = format_ton(Decimal(payment.amount))
+            else:
+                amount_text = f"{Decimal(payment.amount):.2f}"
             lines.append(
-                f"{date_text} — <b>{payment.amount} {payment.currency}</b> — {status_text}"
+                f"{date_text} — <b>{amount_text} {payment.currency}</b> — {status_text}"
             )
         text = "\n".join(lines)
 
@@ -874,25 +1183,35 @@ async def renew(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy_tariff(callback: CallbackQuery) -> None:
     period = callback.data.split("_", 1)[1]
+    days = int(period)
     labels = {"7": "7 дней", "30": "1 месяц", "90": "3 месяца", "365": "1 год"}
     label = labels.get(period, period)
-    days = int(period) if period.isdigit() else 0
-    price = TARIFF_PRICES.get(days)
-    price_text = f"${price:.2f}" if price is not None else "уточняется"
+    price_usd = tariff_price_usd(days)
 
-    # The payment provider is deliberately not faked here.
-    await edit_screen(
-        callback,
-        key="tariffs",
-        text=(
-            f"<b>💳 Выбран тариф: {label}</b>\n"
-            f"💵 Стоимость: <b>{price_text}</b>\n\n"
-            "Платёжная система пока не подключена.\n\n"
-            "На следующем этапе здесь будет реальная оплата, "
-            "проверка платежа и автоматическая активация подписки."
-        ),
-        keyboard=back_kb("tariffs"),
+    if price_usd is None:
+        await callback.answer("Неизвестный тариф", show_alert=True)
+        return
+
+    payment = await create_ton_payment(callback.from_user.id, days)
+    if payment is None:
+        await callback.answer("Не удалось получить курс TON. Попробуйте позже.", show_alert=True)
+        return
+
+    ton_price = TON_USD_PRICE or Decimal("0")
+    expires_text = payment.expires_at.strftime("%H:%M:%S") if payment.expires_at else "—"
+    text = (
+        f"<b>💎 Оплата TON</b>\n\n"
+        f"Тариф: <b>{label}</b>\n"
+        f"Цена: <b>${price_usd:.2f}</b>\n"
+        f"Курс TON: <b>${ton_price:.4f}</b>\n"
+        f"К оплате: <code>{format_ton(payment.amount)} TON</code>\n\n"
+        f"💎 Кошелёк получателя:\n<code>{TON_WALLET_ADDRESS}</code>\n\n"
+        f"🆔 Заказ: <code>{payment.order_id}</code>\n"
+        f"⏱ Оплатить до: <b>{expires_text}</b>\n\n"
+        "Переведите точную сумму TON на указанный кошелёк.\n"
+        "После перевода нажмите «💎 Я оплатил»."
     )
+    await edit_screen(callback, key="tariffs", text=text, keyboard=ton_payment_kb(payment.id))
 
 
 # ----------------------------- User promo code -----------------------------
@@ -1106,7 +1425,7 @@ async def admin_stats(callback: CallbackQuery) -> None:
         "<b>📊 Статистика и аналитика</b>\n\n"
         f"👥 Пользователей: <b>{total_users}</b>\n"
         f"🟢 Активных подписок: <b>{active_subscriptions}</b>\n"
-        f"💰 Оплачено: <b>${revenue}</b>\n"
+        f"💰 Оплачено: <b>{revenue} сум</b>\n"
         f"💳 Успешных платежей: <b>{paid_payments}</b>"
     )
 
@@ -1202,7 +1521,7 @@ async def admin_search(message: Message, state: FSMContext) -> None:
         f"{subscription_info}\n\n"
         f"📱 Устройства: <b>{user.devices}</b>\n"
         f"🎁 Приглашено друзей: <b>{user.referrals}</b>\n"
-        f"💰 Баланс: <b>${user.balance}</b>",
+        f"💰 Баланс: <b>{user.balance} сум</b>",
         reply_markup=keyboard,
     )
 
@@ -1535,6 +1854,33 @@ async def admin_promo_uses(message: Message, state: FSMContext) -> None:
     )
 
 
+@dp.callback_query(F.data.startswith("ton_check_"))
+async def check_ton_payment(callback: CallbackQuery) -> None:
+    try:
+        payment_id = int(callback.data.split("_", 2)[2])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный заказ", show_alert=True)
+        return
+
+    await callback.answer("🔎 Проверяю блокчейн...")
+    ok, message = await confirm_ton_payment(payment_id, callback.from_user.id)
+
+    if ok:
+        await edit_screen(
+            callback,
+            key="tariffs",
+            text=f"<b>💎 Оплата TON</b>\n\n{message}\n\nОткройте «Мой VPN», чтобы продолжить.",
+            keyboard=back_kb("tariffs"),
+        )
+    else:
+        await edit_screen(
+            callback,
+            key="tariffs",
+            text=f"<b>💎 Проверка оплаты</b>\n\n{message}",
+            keyboard=back_kb("tariffs"),
+        )
+
+
 # ----------------------------- Fallback -----------------------------
 
 @dp.message()
@@ -1553,8 +1899,15 @@ async def fallback(message: Message) -> None:
 
 async def main() -> None:
     await init_db()
+    await refresh_ton_price(force=True)
+    ton_task = asyncio.create_task(ton_price_loop())
+
     log.info("VPN bot started")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        ton_task.cancel()
+        await asyncio.gather(ton_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
