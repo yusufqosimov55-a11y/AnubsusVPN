@@ -48,6 +48,9 @@ TON_WALLET_ADDRESS = os.getenv(
 ).strip()
 TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "").strip()
+# Manual bank-card payment details. Put your public payment details in Render.
+# Do NOT put secret banking credentials or passwords here.
+CARD_PAYMENT_DETAILS = os.getenv("CARD_PAYMENT_DETAILS", "5614 6812 5331 8145").strip()
 TON_PRICE_REFRESH_SECONDS = 300  # 5 minutes
 TON_ORDER_TTL_SECONDS = 15 * 60
 TON_API_BASE = "https://toncenter.com/api/v3"
@@ -55,6 +58,8 @@ COINGECKO_PRICE_URL = (
     "https://api.coingecko.com/api/v3/simple/price"
     "?ids=the-open-network&vs_currencies=usd&precision=full"
 )
+# Public Binance market-data fallback. No API key is required for this endpoint.
+BINANCE_TON_PRICE_URL = "https://data-api.binance.vision/api/v3/ticker/price?symbol=TONUSDT"
 
 TARIFF_PRICES_USD = {
     7: Decimal("1.00"),
@@ -134,7 +139,10 @@ class Payment(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # Fiat/base amount of the order. For TON payments this stores the USD tariff price.
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0, nullable=False)
+    # Exact crypto amount with 9-decimal TON precision.
+    crypto_amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 9), nullable=True)
     currency: Mapped[str] = mapped_column(String(16), default="UZS", nullable=False)
     method: Mapped[str | None] = mapped_column(String(64), nullable=True)
     provider: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -195,6 +203,12 @@ engine = create_async_engine(
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
+async def ensure_payment_schema() -> None:
+    """Add TON-specific columns to an existing Neon database safely."""
+    async with engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS crypto_amount NUMERIC(24, 9)"))
+
+
 async def init_db() -> None:
     """Create missing tables on first launch.
 
@@ -226,24 +240,45 @@ def tariff_price_usd(days: int) -> Decimal | None:
 
 
 async def fetch_ton_usd_price() -> Decimal:
+    """Fetch TON/USD from CoinGecko, with Binance public market data as fallback."""
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    # 1) CoinGecko. A Demo/Pro key is optional in configuration; if it fails,
+    # fall back to the public Binance market-data endpoint below.
     headers = {"accept": "application/json"}
     if COINGECKO_API_KEY:
         headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
 
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as http:
-        async with http.get(COINGECKO_PRICE_URL) as response:
-            response.raise_for_status()
-            data = await response.json()
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as http:
+            async with http.get(COINGECKO_PRICE_URL) as response:
+                if response.status < 400:
+                    data = await response.json()
+                    raw_price = data.get("the-open-network", {}).get("usd")
+                    if raw_price is not None:
+                        price = Decimal(str(raw_price))
+                        if price > 0:
+                            return price
+                else:
+                    body = await response.text()
+                    log.warning("CoinGecko price request failed: HTTP %s: %s", response.status, body[:300])
+    except Exception:
+        log.exception("CoinGecko price request failed")
 
-    raw_price = data.get("the-open-network", {}).get("usd")
-    if raw_price is None:
-        raise RuntimeError("CoinGecko did not return TON/USD price")
-
-    price = Decimal(str(raw_price))
-    if price <= 0:
-        raise RuntimeError("Invalid TON/USD price")
-    return price
+    # 2) Binance public market data: TON/USDT is used as a close USD proxy.
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as http:
+            async with http.get(BINANCE_TON_PRICE_URL) as response:
+                response.raise_for_status()
+                data = await response.json()
+        raw_price = data.get("price")
+        price = Decimal(str(raw_price))
+        if price <= 0:
+            raise RuntimeError("Invalid Binance TON/USDT price")
+        return price
+    except Exception:
+        log.exception("Binance TON/USDT price request failed")
+        raise RuntimeError("Не удалось получить актуальный курс TON/USD")
 
 
 async def refresh_ton_price(force: bool = False) -> Decimal | None:
@@ -302,13 +337,13 @@ async def create_ton_payment(telegram_id: int, tariff_days: int) -> Payment | No
             return None
 
         result = await session.execute(
-            select(Payment.amount).where(
+            select(Payment.crypto_amount).where(
                 Payment.currency == "TON",
                 Payment.status == "pending",
                 Payment.expires_at > now,
             )
         )
-        used_amounts = {Decimal(str(row[0])) for row in result.all()}
+        used_amounts = {Decimal(str(row[0])) for row in result.all() if row[0] is not None}
 
         # A tiny nanotons offset makes simultaneous orders distinguishable.
         for _ in range(20):
@@ -321,10 +356,11 @@ async def create_ton_payment(telegram_id: int, tariff_days: int) -> Payment | No
 
         payment = Payment(
             user_id=user.id,
-            amount=amount,
+            amount=price_usd,
+            crypto_amount=amount,
             currency="TON",
             method="TON",
-            provider="TON Center + CoinGecko",
+            provider="TON Center + CoinGecko/Binance",
             order_id=order_id,
             tariff_days=tariff_days,
             status="pending",
@@ -380,7 +416,7 @@ async def find_ton_transaction(payment: Payment) -> str | None:
             response.raise_for_status()
             data = await response.json()
 
-    expected_nanotons = int(Decimal(payment.amount) * Decimal("1000000000"))
+    expected_nanotons = int(Decimal(payment.crypto_amount or 0) * Decimal("1000000000"))
 
     async with SessionLocal() as session:
         for tx in data.get("transactions", []):
@@ -749,15 +785,25 @@ def tariffs_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="7 дней", callback_data="buy_7"),
-                InlineKeyboardButton(text="1 месяц", callback_data="buy_30"),
+                InlineKeyboardButton(text="7 дней — $1.00", callback_data="buy_7"),
+                InlineKeyboardButton(text="1 месяц — $3.00", callback_data="buy_30"),
             ],
             [
-                InlineKeyboardButton(text="3 месяца", callback_data="buy_90"),
-                InlineKeyboardButton(text="1 год", callback_data="buy_365"),
+                InlineKeyboardButton(text="3 месяца — $7.50", callback_data="buy_90"),
+                InlineKeyboardButton(text="1 год — $25.00", callback_data="buy_365"),
             ],
             [InlineKeyboardButton(text="🎟 Ввести промокод", callback_data="promo")],
             [InlineKeyboardButton(text="↩️ В меню", callback_data="home")],
+        ]
+    )
+
+
+def payment_methods_kb(days: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💎 TON", callback_data=f"pay_ton_{days}")],
+            [InlineKeyboardButton(text="💳 Uzcard / Humo", callback_data=f"pay_card_{days}")],
+            [InlineKeyboardButton(text="↩️ Назад к тарифам", callback_data="tariffs")],
         ]
     )
 
@@ -807,6 +853,7 @@ def admin_kb() -> InlineKeyboardMarkup:
 
 class UserStates(StatesGroup):
     promo = State()
+    card_receipt = State()
 
 
 class AdminStates(StatesGroup):
@@ -1133,7 +1180,7 @@ async def payments(callback: CallbackQuery) -> None:
             date_text = payment.created_at.strftime("%d.%m.%Y %H:%M")
             status_text = "✅ Оплачен" if payment.status == "paid" else "⏳ Ожидает"
             if payment.currency == "TON":
-                amount_text = format_ton(Decimal(payment.amount))
+                amount_text = format_ton(Decimal(payment.crypto_amount or 0))
             else:
                 amount_text = f"{Decimal(payment.amount):.2f}"
             lines.append(
@@ -1192,26 +1239,354 @@ async def buy_tariff(callback: CallbackQuery) -> None:
         await callback.answer("Неизвестный тариф", show_alert=True)
         return
 
+    await edit_screen(
+        callback,
+        key="tariffs",
+        text=(
+            "<b>💳 Выберите способ оплаты</b>\n\n"
+            f"Тариф: <b>{label}</b>\n"
+            f"Стоимость: <b>${price_usd:.2f}</b>\n\n"
+            "Выберите удобный способ оплаты:"
+        ),
+        keyboard=payment_methods_kb(days),
+    )
+
+
+@dp.callback_query(F.data.startswith("pay_ton_"))
+async def pay_ton(callback: CallbackQuery) -> None:
+    try:
+        days = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный тариф", show_alert=True)
+        return
+
+    price_usd = tariff_price_usd(days)
+    if price_usd is None:
+        await callback.answer("Неизвестный тариф", show_alert=True)
+        return
+
     payment = await create_ton_payment(callback.from_user.id, days)
     if payment is None:
-        await callback.answer("Не удалось получить курс TON. Попробуйте позже.", show_alert=True)
+        await callback.answer(
+            "Не удалось получить курс TON. Попробуйте через несколько секунд.",
+            show_alert=True,
+        )
         return
 
     ton_price = TON_USD_PRICE or Decimal("0")
     expires_text = payment.expires_at.strftime("%H:%M:%S") if payment.expires_at else "—"
     text = (
         f"<b>💎 Оплата TON</b>\n\n"
-        f"Тариф: <b>{label}</b>\n"
+        f"Тариф: <b>{days} дней</b>\n"
         f"Цена: <b>${price_usd:.2f}</b>\n"
-        f"Курс TON: <b>${ton_price:.4f}</b>\n"
-        f"К оплате: <code>{format_ton(payment.amount)} TON</code>\n\n"
+        f"Курс: <b>1 TON ≈ ${ton_price:.4f}</b>\n"
+        f"К оплате: <code>{format_ton(payment.crypto_amount or 0)} TON</code>\n\n"
         f"💎 Кошелёк получателя:\n<code>{TON_WALLET_ADDRESS}</code>\n\n"
         f"🆔 Заказ: <code>{payment.order_id}</code>\n"
         f"⏱ Оплатить до: <b>{expires_text}</b>\n\n"
         "Переведите точную сумму TON на указанный кошелёк.\n"
+        "В комментарии к переводу желательно указать ID заказа.\n\n"
         "После перевода нажмите «💎 Я оплатил»."
     )
     await edit_screen(callback, key="tariffs", text=text, keyboard=ton_payment_kb(payment.id))
+
+
+@dp.callback_query(F.data.startswith("pay_card_"))
+async def pay_card(callback: CallbackQuery) -> None:
+    try:
+        days = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный тариф", show_alert=True)
+        return
+
+    price_usd = tariff_price_usd(days)
+    if price_usd is None:
+        await callback.answer("Неизвестный тариф", show_alert=True)
+        return
+
+    if not CARD_PAYMENT_DETAILS:
+        await callback.answer("Реквизиты карты ещё не настроены администратором.", show_alert=True)
+        return
+
+    order_id = "CARD-" + secrets.token_hex(5).upper()
+    expires_at = utc_now() + timedelta(minutes=30)
+
+    async with SessionLocal() as session:
+        user = await get_user(session, callback.from_user.id)
+        if user is None:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+
+        payment = Payment(
+            user_id=user.id,
+            amount=price_usd,
+            currency="USD",
+            method="Uzcard/Humo",
+            provider="Manual card verification",
+            order_id=order_id,
+            tariff_days=days,
+            status="pending",
+            expires_at=expires_at,
+        )
+        session.add(payment)
+        await session.commit()
+        await session.refresh(payment)
+
+    expires_text = expires_at.strftime("%H:%M:%S")
+    text = (
+        "<b>💳 ОПЛАТА UZCARD / HUMO</b>\n\n"
+        f"Тариф: <b>{days} дней</b>\n"
+        f"К оплате: <b>${price_usd:.2f}</b>\n"
+        f"🆔 Заказ: <code>{order_id}</code>\n"
+        f"⏱ Оплатить до: <b>{expires_text}</b>\n\n"
+        "<b>💳 НОМЕР КАРТЫ ДЛЯ ОПЛАТЫ:</b>\n"
+        f"<pre>{CARD_PAYMENT_DETAILS}</pre>\n\n"
+        "<b>⚠️ ДЕНЬГИ ПОСТУПЯТ ТОЛЬКО ПОСЛЕ ПРОВЕРКИ АДМИНИСТРАТОРОМ.</b>\n"
+        "<b>📎 ЧЕК ОБЯЗАТЕЛЕН.</b>\n"
+        "<b>❗ БЕЗ ЧЕКА ПЛАТЁЖ МОЖЕТ БЫТЬ НЕ ЗАСЧИТАН.</b>\n"
+        "<b>❗ ЕСЛИ ЗАКАЗ ИСТЕЧЁТ, СОЗДАЙТЕ НОВЫЙ ЗАКАЗ И ОБЯЗАТЕЛЬНО СОХРАНИТЕ ЧЕК.</b>\n\n"
+        "После перевода нажмите кнопку ниже и отправьте фото/скриншот или документ с чеком.\n"
+        "Администратор лично проверит поступление денег и только после этого выдаст подписку."
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📎 Я оплатил — отправить чек", callback_data=f"card_receipt_{payment.id}")],
+            [InlineKeyboardButton(text="↩️ Выбрать другой способ", callback_data=f"buy_{days}")],
+        ]
+    )
+    await edit_screen(callback, key="tariffs", text=text, keyboard=keyboard)
+
+
+@dp.callback_query(F.data.startswith("card_receipt_"))
+async def card_receipt_start(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        payment_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный заказ", show_alert=True)
+        return
+
+    async with SessionLocal() as session:
+        payment = await session.get(Payment, payment_id)
+        user = await get_user(session, callback.from_user.id)
+        if payment is None or user is None or payment.user_id != user.id or payment.currency != "USD":
+            await callback.answer("Заказ не найден", show_alert=True)
+            return
+        if payment.status != "pending":
+            await callback.answer("Этот заказ уже обработан или закрыт.", show_alert=True)
+            return
+        if payment.expires_at and payment.expires_at < utc_now():
+            payment.status = "expired"
+            await session.commit()
+            await callback.answer("Срок заказа истёк. Создайте новый заказ.", show_alert=True)
+            return
+
+    await state.set_state(UserStates.card_receipt)
+    await state.update_data(card_payment_id=payment_id)
+    await callback.message.answer(
+        "📎 <b>ОТПРАВЬТЕ ЧЕК ОБ ОПЛАТЕ</b>\n\n"
+        "<b>ЧЕК ОБЯЗАТЕЛЕН — БЕЗ НЕГО ПЛАТЁЖ НЕ ПЕРЕДАЁТСЯ НА ПРОВЕРКУ.</b>\n\n"
+        "Отправьте фото/скриншот чека или документ.\n"
+        "После получения чек будет передан администратору.\n"
+        "<b>ДЕНЬГИ ЗАСЧИТЫВАЮТСЯ ТОЛЬКО ПОСЛЕ РУЧНОЙ ПРОВЕРКИ АДМИНИСТРАТОРОМ.</b>\n\n"
+        "Если передумали — отправьте: <code>ОТМЕНА</code>"
+    )
+    await callback.answer()
+
+
+@dp.message(UserStates.card_receipt)
+async def card_receipt_received(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    payment_id = int(data.get("card_payment_id", 0) or 0)
+
+    if message.text and message.text.strip().upper() == "ОТМЕНА":
+        await state.clear()
+        return await message.answer("❌ Отправка чека отменена.", reply_markup=home_kb(message.from_user.id))
+
+    # Чек обязателен: принимаем только фото или документ.
+    if not message.photo and not message.document:
+        return await message.answer(
+            "❗ <b>ЧЕК ОБЯЗАТЕЛЕН.</b>\n\n"
+            "Отправьте именно фото/скриншот чека или документ.\n"
+            "Текст, голосовые и другие сообщения не принимаются как подтверждение оплаты."
+        )
+
+    async with SessionLocal() as session:
+        payment = await session.get(Payment, payment_id)
+        user = await get_user(session, message.from_user.id)
+        if payment is None or user is None or payment.user_id != user.id:
+            await state.clear()
+            return await message.answer("❌ Заказ не найден. Создайте новый заказ.", reply_markup=home_kb(message.from_user.id))
+        if payment.status != "pending":
+            await state.clear()
+            return await message.answer("❌ Этот заказ уже обработан или закрыт.", reply_markup=home_kb(message.from_user.id))
+        if payment.expires_at and payment.expires_at < utc_now():
+            payment.status = "expired"
+            await session.commit()
+            await state.clear()
+            return await message.answer("⏱ Срок заказа истёк. Создайте новый заказ.", reply_markup=home_kb(message.from_user.id))
+
+        username = f"@{user.username}" if user.username else "нет username"
+        admin_text = (
+            "<b>💳 Новый чек на ручную проверку</b>\n\n"
+            f"🆔 Заказ: <code>{payment.order_id}</code>\n"
+            f"👤 Пользователь: <code>{user.telegram_id}</code> ({username})\n"
+            f"📦 Тариф: <b>{payment.tariff_days} дней</b>\n"
+            f"💵 Сумма: <b>${payment.amount:.2f}</b>\n"
+            "💳 Метод: <b>Uzcard / Humo</b>\n\n"
+            "Проверь поступление денег по своей карте/приложению и выбери действие ниже."
+        )
+        admin_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Оплата получена", callback_data=f"card_approve_{payment.id}"),
+                    InlineKeyboardButton(text="❌ Не поступила", callback_data=f"card_reject_{payment.id}"),
+                ]
+            ]
+        )
+
+    if ADMIN_ID <= 0:
+        await state.clear()
+        return await message.answer("⚠️ Администратор не настроен. Обратитесь в поддержку.")
+
+    try:
+        await bot.send_message(ADMIN_ID, admin_text, reply_markup=admin_keyboard)
+        # Forward/copy the actual receipt so the admin can inspect it.
+        await bot.copy_message(ADMIN_ID, message.chat.id, message.message_id)
+    except Exception:
+        log.exception("Failed to send card receipt to admin")
+        return await message.answer("⚠️ Не удалось передать чек администратору. Попробуйте отправить его ещё раз.")
+
+    await state.clear()
+    await message.answer(
+        "✅ Чек отправлен администратору.\n\n"
+        "Ожидайте ручной проверки оплаты. После подтверждения подписка будет выдана автоматически.",
+        reply_markup=home_kb(message.from_user.id),
+    )
+
+
+async def approve_manual_card_payment(payment_id: int) -> tuple[bool, str, int | None]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Payment).where(Payment.id == payment_id).with_for_update()
+        )
+        payment = result.scalar_one_or_none()
+        if payment is None or payment.method != "Uzcard/Humo":
+            return False, "Платёж не найден.", None
+        if payment.status == "paid":
+            user = await session.get(User, payment.user_id)
+            return True, "Платёж уже подтверждён.", user.telegram_id if user else None
+        if payment.status != "pending":
+            return False, f"Платёж имеет статус: {payment.status}.", None
+
+        user = await session.get(User, payment.user_id)
+        if user is None:
+            return False, "Пользователь не найден.", None
+
+        now = utc_now()
+        payment.status = "paid"
+        payment.paid_at = now
+        payment.transaction_id = "MANUAL-CARD-" + secrets.token_hex(8).upper()
+
+        sub_result = await session.execute(
+            select(Subscription)
+            .where(
+                Subscription.user_id == user.id,
+                Subscription.status == "active",
+            )
+            .order_by(Subscription.expires_at.desc())
+            .limit(1)
+            .with_for_update()
+        )
+        subscription = sub_result.scalar_one_or_none()
+        days = int(payment.tariff_days or 0)
+        if subscription and subscription.expires_at > now:
+            subscription.expires_at += timedelta(days=days)
+            subscription.updated_at = now
+        elif subscription:
+            subscription.expires_at = now + timedelta(days=days)
+            subscription.status = "active"
+            subscription.updated_at = now
+        else:
+            session.add(Subscription(
+                user_id=user.id,
+                expires_at=now + timedelta(days=days),
+                status="active",
+                created_at=now,
+                updated_at=now,
+            ))
+
+        await session.commit()
+        return True, f"Оплата подтверждена. Выдано: {days} дней.", user.telegram_id
+
+
+@dp.callback_query(F.data.startswith("card_approve_"))
+async def card_approve(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    try:
+        payment_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный платёж.", show_alert=True)
+        return
+
+    ok, result_text, telegram_id = await approve_manual_card_payment(payment_id)
+    await callback.answer("Готово" if ok else "Ошибка", show_alert=not ok)
+    if not ok:
+        return
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(f"✅ {result_text}")
+    if telegram_id:
+        try:
+            await bot.send_message(
+                telegram_id,
+                "<b>✅ Оплата подтверждена!</b>\n\n"
+                "Ваша подписка успешно активирована/продлена.\n"
+                "Откройте «Мой VPN», чтобы продолжить.",
+                reply_markup=home_kb(telegram_id),
+            )
+        except Exception:
+            log.exception("Failed to notify user about manual card payment")
+
+
+@dp.callback_query(F.data.startswith("card_reject_"))
+async def card_reject(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    try:
+        payment_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный платёж.", show_alert=True)
+        return
+
+    async with SessionLocal() as session:
+        payment = await session.get(Payment, payment_id)
+        if payment is None or payment.method != "Uzcard/Humo":
+            await callback.answer("Платёж не найден.", show_alert=True)
+            return
+        if payment.status != "pending":
+            await callback.answer("Платёж уже обработан.", show_alert=True)
+            return
+        payment.status = "rejected"
+        await session.commit()
+        user = await session.get(User, payment.user_id)
+        telegram_id = user.telegram_id if user else None
+
+    await callback.answer("Отклонено")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("❌ Платёж отмечен как не поступивший.")
+    if telegram_id:
+        try:
+            await bot.send_message(
+                telegram_id,
+                "<b>❌ Оплата пока не подтверждена</b>\n\n"
+                "Администратор не подтвердил поступление средств. Если деньги уже списались, обратитесь в поддержку и приложите чек.",
+                reply_markup=home_kb(telegram_id),
+            )
+        except Exception:
+            log.exception("Failed to notify user about rejected manual card payment")
 
 
 # ----------------------------- User promo code -----------------------------
@@ -1899,6 +2274,7 @@ async def fallback(message: Message) -> None:
 
 async def main() -> None:
     await init_db()
+    await ensure_payment_schema()
     await refresh_ton_price(force=True)
     ton_task = asyncio.create_task(ton_price_loop())
 
