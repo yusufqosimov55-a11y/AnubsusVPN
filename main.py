@@ -38,6 +38,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
+# ----------------------------- Pricing -----------------------------
+# Prices are displayed and stored in USD.
+BALANCE_CURRENCY = "USD"
+TARIFF_PRICES = {
+    7: Decimal("1.00"),
+    30: Decimal("3.00"),
+    90: Decimal("7.50"),
+    365: Decimal("25.00"),
+}
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
@@ -103,10 +113,12 @@ class Subscription(Base):
 class Payment(Base):
     __tablename__ = "payments"
 
+    # Payment amounts are currently denominated in USD.
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0, nullable=False)
-    currency: Mapped[str] = mapped_column(String(16), default="UZS", nullable=False)
+    currency: Mapped[str] = mapped_column(String(16), default="USD", nullable=False)
     method: Mapped[str | None] = mapped_column(String(64), nullable=True)
     provider: Mapped[str | None] = mapped_column(String(128), nullable=True)
     transaction_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
@@ -432,12 +444,12 @@ def tariffs_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="7 дней", callback_data="buy_7"),
-                InlineKeyboardButton(text="1 месяц", callback_data="buy_30"),
+                InlineKeyboardButton(text="7 дней — $1.00", callback_data="buy_7"),
+                InlineKeyboardButton(text="1 месяц — $3.00", callback_data="buy_30"),
             ],
             [
-                InlineKeyboardButton(text="3 месяца", callback_data="buy_90"),
-                InlineKeyboardButton(text="1 год", callback_data="buy_365"),
+                InlineKeyboardButton(text="3 месяца — $7.50", callback_data="buy_90"),
+                InlineKeyboardButton(text="1 год — $25.00", callback_data="buy_365"),
             ],
             [InlineKeyboardButton(text="🎟 Ввести промокод", callback_data="promo")],
             [InlineKeyboardButton(text="↩️ В меню", callback_data="home")],
@@ -573,13 +585,13 @@ TARIFFS_TEXT = """
 
 Выберите срок подписки:
 
-🟢 7 дней — тестовый вариант
-🔵 1 месяц — стандартный тариф
-🟣 3 месяца — длительный доступ
-🟠 1 год — годовая подписка
+🟢 7 дней — <b>$1.00</b>
+🔵 1 месяц — <b>$3.00</b>
+🟣 3 месяца — <b>$7.50</b>
+🟠 1 год — <b>$25.00</b>
 
-Стоимость и платёжную систему можно изменить
-в одном месте конфигурации.
+Цены указаны в долларах США.
+Выберите срок подписки ниже.
 """
 
 CABINET_TEXT = """
@@ -590,7 +602,7 @@ CABINET_TEXT = """
 
 📱 Устройства: <b>{devices}</b>
 🎁 Приглашено друзей: <b>{referrals}</b>
-💰 Баланс: <b>{balance} сум</b>
+💰 Баланс: <b>${balance}</b>
 """
 
 SUPPORT_TEXT = """
@@ -864,13 +876,17 @@ async def buy_tariff(callback: CallbackQuery) -> None:
     period = callback.data.split("_", 1)[1]
     labels = {"7": "7 дней", "30": "1 месяц", "90": "3 месяца", "365": "1 год"}
     label = labels.get(period, period)
+    days = int(period) if period.isdigit() else 0
+    price = TARIFF_PRICES.get(days)
+    price_text = f"${price:.2f}" if price is not None else "уточняется"
 
     # The payment provider is deliberately not faked here.
     await edit_screen(
         callback,
         key="tariffs",
         text=(
-            f"<b>💳 Выбран тариф: {label}</b>\n\n"
+            f"<b>💳 Выбран тариф: {label}</b>\n"
+            f"💵 Стоимость: <b>{price_text}</b>\n\n"
             "Платёжная система пока не подключена.\n\n"
             "На следующем этапе здесь будет реальная оплата, "
             "проверка платежа и автоматическая активация подписки."
@@ -1090,7 +1106,7 @@ async def admin_stats(callback: CallbackQuery) -> None:
         "<b>📊 Статистика и аналитика</b>\n\n"
         f"👥 Пользователей: <b>{total_users}</b>\n"
         f"🟢 Активных подписок: <b>{active_subscriptions}</b>\n"
-        f"💰 Оплачено: <b>{revenue} сум</b>\n"
+        f"💰 Оплачено: <b>${revenue}</b>\n"
         f"💳 Успешных платежей: <b>{paid_payments}</b>"
     )
 
@@ -1186,7 +1202,7 @@ async def admin_search(message: Message, state: FSMContext) -> None:
         f"{subscription_info}\n\n"
         f"📱 Устройства: <b>{user.devices}</b>\n"
         f"🎁 Приглашено друзей: <b>{user.referrals}</b>\n"
-        f"💰 Баланс: <b>{user.balance} сум</b>",
+        f"💰 Баланс: <b>${user.balance}</b>",
         reply_markup=keyboard,
     )
 
