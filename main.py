@@ -52,6 +52,9 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "").strip()
 # Manual bank-card payment details. Put your public payment details in Render.
 # Do NOT put secret banking credentials or passwords here.
 CARD_PAYMENT_DETAILS = os.getenv("CARD_PAYMENT_DETAILS", "5614 6812 5331 8145").strip()
+NEWS_CHANNEL_URL = "https://t.me/AnobsusVPN_NEWS"
+REFERRAL_REWARD_HOURS = 3
+REFERRAL_NEW_USER_WINDOW_SECONDS = 15 * 60
 CBU_RATE_REFRESH_SECONDS = 300  # 5 minutes
 CBU_USD_RATE_URL = "https://cbu.uz/ru/arkhiv-kursov-valyut/json/USD/"
 TON_PRICE_REFRESH_SECONDS = 300  # 5 minutes
@@ -115,6 +118,8 @@ class User(Base):
     first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     devices: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     referrals: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    referred_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    referral_processed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     balance: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0, nullable=False)
     trial_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -247,6 +252,8 @@ async def init_db() -> None:
         # Existing Neon databases need these small additive migrations.
         await connection.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS order_id VARCHAR(64)"))
         await connection.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ"))
+        await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT"))
+        await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_processed BOOLEAN NOT NULL DEFAULT FALSE"))
         await connection.execute(text("ALTER TABLE payments ALTER COLUMN amount TYPE NUMERIC(24, 9)"))
         await connection.execute(
             text("CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_order_id ON payments(order_id) WHERE order_id IS NOT NULL")
@@ -650,6 +657,112 @@ IMAGES = {
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def parse_referrer_id(message: Message) -> int | None:
+    """Read Telegram /start deep-link payload: /start ref_<telegram_id>."""
+    text_value = (message.text or "").strip()
+    if not text_value.startswith("/start"):
+        return None
+    parts = text_value.split(maxsplit=1)
+    if len(parts) != 2:
+        return None
+    payload = parts[1].strip()
+    if not payload.startswith("ref_"):
+        return None
+    try:
+        referrer_id = int(payload[4:])
+    except (TypeError, ValueError):
+        return None
+    return referrer_id if referrer_id > 0 else None
+
+
+async def add_subscription_hours_in_session(
+    session: AsyncSession,
+    user_id: int,
+    hours: int,
+    now: datetime | None = None,
+) -> datetime | None:
+    if hours <= 0:
+        return None
+
+    now = now or utc_now()
+    result = await session.execute(
+        select(Subscription)
+        .where(
+            Subscription.user_id == user_id,
+            Subscription.status == "active",
+        )
+        .order_by(Subscription.expires_at.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    subscription = result.scalar_one_or_none()
+
+    if subscription and subscription.expires_at > now:
+        subscription.expires_at = subscription.expires_at + timedelta(hours=hours)
+        subscription.updated_at = now
+    elif subscription:
+        subscription.status = "active"
+        subscription.expires_at = now + timedelta(hours=hours)
+        subscription.updated_at = now
+    else:
+        subscription = Subscription(
+            user_id=user_id,
+            expires_at=now + timedelta(hours=hours),
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(subscription)
+
+    return subscription.expires_at
+
+
+async def process_referral_start(telegram_id: int, referrer_telegram_id: int | None) -> bool:
+    """Give the inviter 3 hours once when a genuinely new user joins via referral."""
+    if not referrer_telegram_id or referrer_telegram_id == telegram_id:
+        return False
+
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(User).where(User.telegram_id == telegram_id).with_for_update()
+        )
+        invited = result.scalar_one_or_none()
+        if invited is None or invited.referral_processed:
+            return False
+
+        # Only a newly-created account can consume a referral link.
+        if (utc_now() - invited.created_at).total_seconds() > REFERRAL_NEW_USER_WINDOW_SECONDS:
+            invited.referral_processed = True
+            await session.commit()
+            return False
+
+        ref_result = await session.execute(
+            select(User).where(User.telegram_id == referrer_telegram_id).with_for_update()
+        )
+        referrer = ref_result.scalar_one_or_none()
+
+        invited.referral_processed = True
+        if referrer is None:
+            await session.commit()
+            return False
+
+        invited.referred_by = referrer.id
+        referrer.referrals += 1
+        await add_subscription_hours_in_session(session, referrer.id, REFERRAL_REWARD_HOURS)
+        await session.commit()
+
+    try:
+        await bot.send_message(
+            referrer_telegram_id,
+            "🎉 <b>Друг присоединился по вашей ссылке!</b>\n\n"
+            f"🎁 Вам начислено <b>{REFERRAL_REWARD_HOURS} часа</b> бесплатного VPN.",
+        )
+    except Exception:
+        log.exception("Failed to notify referrer %s about referral reward", referrer_telegram_id)
+
+    return True
 
 
 async def ensure_user(telegram_user) -> User:
@@ -1100,15 +1213,18 @@ SERVERS_TEXT = """
 """
 
 REFERRAL_TEXT = """
-<b>👥 Партнёрская программа</b>
+<b>👥 Пригласи друга</b>
 
-Приглашайте друзей по своей ссылке.
+Приглашайте друзей по своей персональной ссылке.
+
+🎁 <b>За каждого нового друга — 3 часа бесплатного VPN.</b>
+
+Ваших приглашённых: <b>{referrals}</b>
 
 🔗 Ваша ссылка:
-<code>https://t.me/ВАШ_БОТ?start=ref_{user_id}</code>
+<code>{referral_link}</code>
 
-🎁 Условия и бонусы можно настроить после подключения
-платежей и реальной системы подписок.
+Награда начисляется автоматически, когда новый пользователь впервые запускает бота по вашей ссылке.
 """
 
 PROXY_TEXT = """
@@ -1140,6 +1256,9 @@ INSTRUCTIONS_TEXT = """
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await ensure_user(message.from_user)
+    referrer_id = parse_referrer_id(message)
+    if referrer_id:
+        await process_referral_start(message.from_user.id, referrer_id)
     await show_screen(
         message,
         key="home",
@@ -1230,7 +1349,17 @@ async def server_selected(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "referral")
 async def referral(callback: CallbackQuery) -> None:
-    text = REFERRAL_TEXT.format(user_id=callback.from_user.id)
+    await ensure_user(callback.from_user)
+    me = await bot.get_me()
+    username = me.username or "AnobsusVPNBot"
+    async with SessionLocal() as session:
+        user = await get_user(session, callback.from_user.id)
+        referrals_count = user.referrals if user else 0
+    referral_link = f"https://t.me/{username}?start=ref_{callback.from_user.id}"
+    text = REFERRAL_TEXT.format(
+        referrals=referrals_count,
+        referral_link=referral_link,
+    )
     await edit_screen(callback, key="referral", text=text, keyboard=back_kb())
 
 
@@ -1892,15 +2021,22 @@ async def promo_entered(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "news")
 async def news(callback: CallbackQuery) -> None:
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Открыть канал новостей", url=NEWS_CHANNEL_URL)],
+            [InlineKeyboardButton(text="↩️ В меню", callback_data="home")],
+        ]
+    )
     await edit_screen(
         callback,
         key="home",
         text=(
-            "<b>📢 Новости</b>\n\n"
-            "Здесь будут последние новости сервиса, "
-            "обслуживание серверов и важные уведомления."
+            "<b>📢 Новости AnobsusVPN</b>\n\n"
+            "Все новости, обновления и важные уведомления "
+            "публикуются в официальном Telegram-канале.\n\n"
+            f"{NEWS_CHANNEL_URL}"
         ),
-        keyboard=back_kb(),
+        keyboard=keyboard,
     )
 
 
