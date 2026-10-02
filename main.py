@@ -39,6 +39,7 @@ ASSETS = BASE_DIR / "assets"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 # ----------------------------- TON payment configuration -----------------------------
@@ -51,6 +52,8 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "").strip()
 # Manual bank-card payment details. Put your public payment details in Render.
 # Do NOT put secret banking credentials or passwords here.
 CARD_PAYMENT_DETAILS = os.getenv("CARD_PAYMENT_DETAILS", "5614 6812 5331 8145").strip()
+CBU_RATE_REFRESH_SECONDS = 300  # 5 minutes
+CBU_USD_RATE_URL = "https://cbu.uz/ru/arkhiv-kursov-valyut/json/USD/"
 TON_PRICE_REFRESH_SECONDS = 300  # 5 minutes
 TON_ORDER_TTL_SECONDS = 15 * 60
 TON_API_BASE = "https://toncenter.com/api/v3"
@@ -71,6 +74,9 @@ TARIFF_PRICES_USD = {
 TON_USD_PRICE: Decimal | None = None
 TON_PRICE_UPDATED_AT: datetime | None = None
 TON_PRICE_LOCK = asyncio.Lock()
+USD_UZS_RATE: Decimal | None = None
+USD_UZS_RATE_UPDATED_AT: datetime | None = None
+USD_UZS_RATE_LOCK = asyncio.Lock()
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -143,6 +149,16 @@ class Payment(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0, nullable=False)
     # Exact crypto amount with 9-decimal TON precision.
     crypto_amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 9), nullable=True)
+    # Explicit immutable pricing snapshot for manual card orders.
+    usd_amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 2), nullable=True)
+    exchange_rate: Mapped[Decimal | None] = mapped_column(Numeric(24, 6), nullable=True)
+    uzs_amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 2), nullable=True)
+    receipt_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    receipt_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    receipt_file_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    receipt_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    confirmed_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     currency: Mapped[str] = mapped_column(String(16), default="UZS", nullable=False)
     method: Mapped[str | None] = mapped_column(String(64), nullable=True)
     provider: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -204,9 +220,18 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSe
 
 
 async def ensure_payment_schema() -> None:
-    """Add TON-specific columns to an existing Neon database safely."""
+    """Add payment columns to an existing Neon database safely."""
     async with engine.begin() as conn:
         await conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS crypto_amount NUMERIC(24, 9)"))
+        await conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS usd_amount NUMERIC(24, 2)"))
+        await conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS exchange_rate NUMERIC(24, 6)"))
+        await conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS uzs_amount NUMERIC(24, 2)"))
+        await conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS receipt_chat_id BIGINT"))
+        await conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS receipt_message_id BIGINT"))
+        await conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS receipt_file_id VARCHAR(512)"))
+        await conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS receipt_type VARCHAR(32)"))
+        await conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS confirmed_by BIGINT"))
+        await conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ"))
 
 
 async def init_db() -> None:
@@ -226,6 +251,82 @@ async def init_db() -> None:
         await connection.execute(
             text("CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_order_id ON payments(order_id) WHERE order_id IS NOT NULL")
         )
+
+
+# ----------------------------- CBU USD/UZS rate helpers -----------------------------
+
+
+async def fetch_usd_uzs_rate() -> Decimal:
+    """Fetch the official USD/UZS rate from CBU."""
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"accept": "application/json"}) as http:
+        async with http.get(CBU_USD_RATE_URL) as response:
+            response.raise_for_status()
+            payload = await response.json(content_type=None)
+
+    rows = payload if isinstance(payload, list) else [payload]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("Ccy", "")).upper() != "USD":
+            continue
+        raw_rate = row.get("Rate")
+        if raw_rate is None:
+            continue
+        rate = Decimal(str(raw_rate).replace(",", "."))
+        if rate > 0:
+            return rate.quantize(Decimal("0.000001"))
+
+    raise ValueError("CBU USD rate not found in response")
+
+
+async def refresh_usd_uzs_rate(force: bool = False) -> Decimal | None:
+    """Refresh CBU rate every five minutes; keep last successful value on errors."""
+    global USD_UZS_RATE, USD_UZS_RATE_UPDATED_AT
+
+    now = utc_now()
+    if (
+        not force
+        and USD_UZS_RATE is not None
+        and USD_UZS_RATE_UPDATED_AT is not None
+        and (now - USD_UZS_RATE_UPDATED_AT).total_seconds() < CBU_RATE_REFRESH_SECONDS
+    ):
+        return USD_UZS_RATE
+
+    async with USD_UZS_RATE_LOCK:
+        now = utc_now()
+        if (
+            not force
+            and USD_UZS_RATE is not None
+            and USD_UZS_RATE_UPDATED_AT is not None
+            and (now - USD_UZS_RATE_UPDATED_AT).total_seconds() < CBU_RATE_REFRESH_SECONDS
+        ):
+            return USD_UZS_RATE
+
+        try:
+            rate = await fetch_usd_uzs_rate()
+            USD_UZS_RATE = rate
+            USD_UZS_RATE_UPDATED_AT = now
+            log.info("CBU USD/UZS rate updated: %s", rate)
+        except Exception:
+            log.exception("Failed to refresh CBU USD/UZS rate")
+            if USD_UZS_RATE is not None:
+                log.warning("Using last successful CBU USD/UZS rate: %s", USD_UZS_RATE)
+            else:
+                log.error("No previous CBU USD/UZS rate is available")
+
+        return USD_UZS_RATE
+
+
+async def usd_uzs_rate_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(CBU_RATE_REFRESH_SECONDS)
+            await refresh_usd_uzs_rate(force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Unexpected error in CBU rate loop")
 
 
 # ----------------------------- TON payment helpers -----------------------------
@@ -717,7 +818,12 @@ def allowed(user_id: int) -> bool:
     return True
 
 
+def is_owner(user_id: int) -> bool:
+    return OWNER_ID != 0 and user_id == OWNER_ID
+
+
 def is_admin(user_id: int) -> bool:
+    """Support operator only. Financial/admin-owner actions never use this check."""
     return ADMIN_ID != 0 and user_id == ADMIN_ID
 
 
@@ -760,7 +866,7 @@ def home_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📢 Новости", callback_data="news")],
     ]
 
-    if user_id is not None and is_admin(user_id):
+    if user_id is not None and is_owner(user_id):
         rows.append([
             InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin")
         ])
@@ -854,6 +960,7 @@ def admin_kb() -> InlineKeyboardMarkup:
 class UserStates(StatesGroup):
     promo = State()
     card_receipt = State()
+    support_message = State()
 
 
 class AdminStates(StatesGroup):
@@ -1178,9 +1285,17 @@ async def payments(callback: CallbackQuery) -> None:
         lines = ["<b>💰 История платежей</b>", ""]
         for payment in rows:
             date_text = payment.created_at.strftime("%d.%m.%Y %H:%M")
-            status_text = "✅ Оплачен" if payment.status == "paid" else "⏳ Ожидает"
+            status_map = {
+                "paid": "✅ Оплачен",
+                "rejected": "❌ Отклонён",
+                "expired": "⌛ Истёк",
+                "pending": "⏳ Ожидает",
+            }
+            status_text = status_map.get(payment.status, payment.status)
             if payment.currency == "TON":
                 amount_text = format_ton(Decimal(payment.crypto_amount or 0))
+            elif payment.currency == "UZS" and payment.uzs_amount is not None:
+                amount_text = f"{Decimal(payment.uzs_amount):.0f}"
             else:
                 amount_text = f"{Decimal(payment.amount):.2f}"
             lines.append(
@@ -1305,8 +1420,19 @@ async def pay_card(callback: CallbackQuery) -> None:
         return
 
     if not CARD_PAYMENT_DETAILS:
-        await callback.answer("Реквизиты карты ещё не настроены администратором.", show_alert=True)
+        await callback.answer("Реквизиты карты ещё не настроены владельцем.", show_alert=True)
         return
+
+    rate = await refresh_usd_uzs_rate()
+    if rate is None:
+        await callback.answer(
+            "Не удалось получить курс ЦБ. Попробуйте ещё раз через несколько секунд.",
+            show_alert=True,
+        )
+        return
+
+    # The rate and total are calculated once and stored with this order.
+    uzs_amount = (price_usd * rate).quantize(Decimal("1"))
 
     order_id = "CARD-" + secrets.token_hex(5).upper()
     expires_at = utc_now() + timedelta(minutes=30)
@@ -1319,8 +1445,11 @@ async def pay_card(callback: CallbackQuery) -> None:
 
         payment = Payment(
             user_id=user.id,
-            amount=price_usd,
-            currency="USD",
+            amount=price_usd,  # legacy/base USD amount; kept for compatibility
+            usd_amount=price_usd,
+            exchange_rate=rate,
+            uzs_amount=uzs_amount,
+            currency="UZS",
             method="Uzcard/Humo",
             provider="Manual card verification",
             order_id=order_id,
@@ -1336,17 +1465,19 @@ async def pay_card(callback: CallbackQuery) -> None:
     text = (
         "<b>💳 ОПЛАТА UZCARD / HUMO</b>\n\n"
         f"Тариф: <b>{days} дней</b>\n"
-        f"К оплате: <b>${price_usd:.2f}</b>\n"
+        f"Цена тарифа: <b>${price_usd:.2f}</b>\n"
+        f"Курс ЦБ: <b>1 USD = {rate:.2f} UZS</b>\n"
+        f"К оплате: <b>{uzs_amount:.0f} UZS</b>\n"
         f"🆔 Заказ: <code>{order_id}</code>\n"
         f"⏱ Оплатить до: <b>{expires_text}</b>\n\n"
         "<b>💳 НОМЕР КАРТЫ ДЛЯ ОПЛАТЫ:</b>\n"
         f"<pre>{CARD_PAYMENT_DETAILS}</pre>\n\n"
-        "<b>⚠️ ДЕНЬГИ ПОСТУПЯТ ТОЛЬКО ПОСЛЕ ПРОВЕРКИ АДМИНИСТРАТОРОМ.</b>\n"
+        "<b>⚠️ ДЕНЬГИ ПОСТУПЯТ ТОЛЬКО ПОСЛЕ ПРОВЕРКИ ВЛАДЕЛЬЦЕМ.</b>\n"
         "<b>📎 ЧЕК ОБЯЗАТЕЛЕН.</b>\n"
         "<b>❗ БЕЗ ЧЕКА ПЛАТЁЖ МОЖЕТ БЫТЬ НЕ ЗАСЧИТАН.</b>\n"
-        "<b>❗ ЕСЛИ ЗАКАЗ ИСТЕЧЁТ, СОЗДАЙТЕ НОВЫЙ ЗАКАЗ И ОБЯЗАТЕЛЬНО СОХРАНИТЕ ЧЕК.</b>\n\n"
+        "<b>❗ ЕСЛИ ЗАКАЗ ИСТЕЧЁТ, СОЗДАЙТЕ НОВЫЙ ЗАКАЗ.</b>\n\n"
         "После перевода нажмите кнопку ниже и отправьте фото/скриншот или документ с чеком.\n"
-        "Администратор лично проверит поступление денег и только после этого выдаст подписку."
+        "Владелец проверит поступление денег и после подтверждения выдаст подписку."
     )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1368,7 +1499,7 @@ async def card_receipt_start(callback: CallbackQuery, state: FSMContext) -> None
     async with SessionLocal() as session:
         payment = await session.get(Payment, payment_id)
         user = await get_user(session, callback.from_user.id)
-        if payment is None or user is None or payment.user_id != user.id or payment.currency != "USD":
+        if payment is None or user is None or payment.user_id != user.id or payment.method != "Uzcard/Humo":
             await callback.answer("Заказ не найден", show_alert=True)
             return
         if payment.status != "pending":
@@ -1386,8 +1517,8 @@ async def card_receipt_start(callback: CallbackQuery, state: FSMContext) -> None
         "📎 <b>ОТПРАВЬТЕ ЧЕК ОБ ОПЛАТЕ</b>\n\n"
         "<b>ЧЕК ОБЯЗАТЕЛЕН — БЕЗ НЕГО ПЛАТЁЖ НЕ ПЕРЕДАЁТСЯ НА ПРОВЕРКУ.</b>\n\n"
         "Отправьте фото/скриншот чека или документ.\n"
-        "После получения чек будет передан администратору.\n"
-        "<b>ДЕНЬГИ ЗАСЧИТЫВАЮТСЯ ТОЛЬКО ПОСЛЕ РУЧНОЙ ПРОВЕРКИ АДМИНИСТРАТОРОМ.</b>\n\n"
+        "После получения чек будет передан владельцу.\n"
+        "<b>ДЕНЬГИ ЗАСЧИТЫВАЮТСЯ ТОЛЬКО ПОСЛЕ РУЧНОЙ ПРОВЕРКИ ВЛАДЕЛЬЦЕМ.</b>\n\n"
         "Если передумали — отправьте: <code>ОТМЕНА</code>"
     )
     await callback.answer()
@@ -1402,7 +1533,6 @@ async def card_receipt_received(message: Message, state: FSMContext) -> None:
         await state.clear()
         return await message.answer("❌ Отправка чека отменена.", reply_markup=home_kb(message.from_user.id))
 
-    # Чек обязателен: принимаем только фото или документ.
     if not message.photo and not message.document:
         return await message.answer(
             "❗ <b>ЧЕК ОБЯЗАТЕЛЕН.</b>\n\n"
@@ -1416,7 +1546,7 @@ async def card_receipt_received(message: Message, state: FSMContext) -> None:
         if payment is None or user is None or payment.user_id != user.id:
             await state.clear()
             return await message.answer("❌ Заказ не найден. Создайте новый заказ.", reply_markup=home_kb(message.from_user.id))
-        if payment.status != "pending":
+        if payment.method != "Uzcard/Humo" or payment.status != "pending":
             await state.clear()
             return await message.answer("❌ Этот заказ уже обработан или закрыт.", reply_markup=home_kb(message.from_user.id))
         if payment.expires_at and payment.expires_at < utc_now():
@@ -1425,17 +1555,36 @@ async def card_receipt_received(message: Message, state: FSMContext) -> None:
             await state.clear()
             return await message.answer("⏱ Срок заказа истёк. Создайте новый заказ.", reply_markup=home_kb(message.from_user.id))
 
+        receipt_type = "photo" if message.photo else "document"
+        receipt_file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+
+        # Persist receipt metadata so the owner can audit the exact payment.
+        payment.receipt_chat_id = message.chat.id
+        payment.receipt_message_id = message.message_id
+        payment.receipt_file_id = receipt_file_id
+        payment.receipt_type = receipt_type
+        await session.commit()
+
         username = f"@{user.username}" if user.username else "нет username"
-        admin_text = (
-            "<b>💳 Новый чек на ручную проверку</b>\n\n"
+        rate_text = f"{payment.exchange_rate:.2f}" if payment.exchange_rate is not None else "—"
+        uzs_text = f"{payment.uzs_amount:.0f}" if payment.uzs_amount is not None else "—"
+        usd_text = f"{payment.usd_amount:.2f}" if payment.usd_amount is not None else f"{payment.amount:.2f}"
+        created_text = payment.created_at.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M:%S")
+
+        owner_text = (
+            "<b>💳 НОВЫЙ ПЛАТЁЖ UZCARD / HUMO</b>\n\n"
             f"🆔 Заказ: <code>{payment.order_id}</code>\n"
             f"👤 Пользователь: <code>{user.telegram_id}</code> ({username})\n"
             f"📦 Тариф: <b>{payment.tariff_days} дней</b>\n"
-            f"💵 Сумма: <b>${payment.amount:.2f}</b>\n"
-            "💳 Метод: <b>Uzcard / Humo</b>\n\n"
-            "Проверь поступление денег по своей карте/приложению и выбери действие ниже."
+            f"💵 USD: <b>${usd_text}</b>\n"
+            f"📈 Зафиксированный курс: <b>1 USD = {rate_text} UZS</b>\n"
+            f"💰 К оплате: <b>{uzs_text} UZS</b>\n"
+            "💳 Метод: <b>Uzcard / Humo</b>\n"
+            f"🕐 Создан: <b>{created_text} UTC</b>\n"
+            "📌 Статус: <b>pending</b>\n\n"
+            "Проверьте поступление средств и выберите действие."
         )
-        admin_keyboard = InlineKeyboardMarkup(
+        owner_keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(text="✅ Оплата получена", callback_data=f"card_approve_{payment.id}"),
@@ -1444,27 +1593,29 @@ async def card_receipt_received(message: Message, state: FSMContext) -> None:
             ]
         )
 
-    if ADMIN_ID <= 0:
+    if OWNER_ID <= 0:
         await state.clear()
-        return await message.answer("⚠️ Администратор не настроен. Обратитесь в поддержку.")
+        return await message.answer("⚠️ OWNER_ID не настроен. Обратитесь в поддержку.")
 
     try:
-        await bot.send_message(ADMIN_ID, admin_text, reply_markup=admin_keyboard)
-        # Forward/copy the actual receipt so the admin can inspect it.
-        await bot.copy_message(ADMIN_ID, message.chat.id, message.message_id)
+        await bot.send_message(OWNER_ID, owner_text, reply_markup=owner_keyboard)
+        await bot.copy_message(OWNER_ID, message.chat.id, message.message_id)
     except Exception:
-        log.exception("Failed to send card receipt to admin")
-        return await message.answer("⚠️ Не удалось передать чек администратору. Попробуйте отправить его ещё раз.")
+        log.exception("Failed to send card receipt to owner")
+        return await message.answer("⚠️ Не удалось передать чек владельцу. Попробуйте отправить его ещё раз.")
 
     await state.clear()
     await message.answer(
-        "✅ Чек отправлен администратору.\n\n"
-        "Ожидайте ручной проверки оплаты. После подтверждения подписка будет выдана автоматически.",
+        "✅ Чек отправлен на проверку владельцу.\n\n"
+        "Ожидайте ручной проверки. После подтверждения подписка будет выдана автоматически.",
         reply_markup=home_kb(message.from_user.id),
     )
 
 
-async def approve_manual_card_payment(payment_id: int) -> tuple[bool, str, int | None]:
+async def approve_manual_card_payment(payment_id: int, owner_id: int) -> tuple[bool, str, int | None]:
+    if not is_owner(owner_id):
+        return False, "Доступ запрещён.", None
+
     async with SessionLocal() as session:
         result = await session.execute(
             select(Payment).where(Payment.id == payment_id).with_for_update()
@@ -1472,19 +1623,32 @@ async def approve_manual_card_payment(payment_id: int) -> tuple[bool, str, int |
         payment = result.scalar_one_or_none()
         if payment is None or payment.method != "Uzcard/Humo":
             return False, "Платёж не найден.", None
+
         if payment.status == "paid":
             user = await session.get(User, payment.user_id)
-            return True, "Платёж уже подтверждён.", user.telegram_id if user else None
+            return True, "Платёж уже был подтверждён. Повторная выдача подписки не выполнялась.", user.telegram_id if user else None
+
         if payment.status != "pending":
             return False, f"Платёж имеет статус: {payment.status}.", None
+
+        if payment.expires_at and payment.expires_at < utc_now():
+            payment.status = "expired"
+            await session.commit()
+            return False, "Срок заказа истёк.", None
 
         user = await session.get(User, payment.user_id)
         if user is None:
             return False, "Пользователь не найден.", None
 
         now = utc_now()
+        days = int(payment.tariff_days or 0)
+        if days <= 0 or payment.uzs_amount is None or payment.exchange_rate is None or payment.usd_amount is None:
+            return False, "У платежа отсутствует сохранённая сумма заказа.", None
+
         payment.status = "paid"
         payment.paid_at = now
+        payment.confirmed_by = owner_id
+        payment.confirmed_at = now
         payment.transaction_id = "MANUAL-CARD-" + secrets.token_hex(8).upper()
 
         sub_result = await session.execute(
@@ -1498,7 +1662,6 @@ async def approve_manual_card_payment(payment_id: int) -> tuple[bool, str, int |
             .with_for_update()
         )
         subscription = sub_result.scalar_one_or_none()
-        days = int(payment.tariff_days or 0)
         if subscription and subscription.expires_at > now:
             subscription.expires_at += timedelta(days=days)
             subscription.updated_at = now
@@ -1521,7 +1684,7 @@ async def approve_manual_card_payment(payment_id: int) -> tuple[bool, str, int |
 
 @dp.callback_query(F.data.startswith("card_approve_"))
 async def card_approve(callback: CallbackQuery) -> None:
-    if callback.from_user.id != ADMIN_ID:
+    if not is_owner(callback.from_user.id):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
     try:
@@ -1530,12 +1693,16 @@ async def card_approve(callback: CallbackQuery) -> None:
         await callback.answer("Некорректный платёж.", show_alert=True)
         return
 
-    ok, result_text, telegram_id = await approve_manual_card_payment(payment_id)
+    ok, result_text, telegram_id = await approve_manual_card_payment(payment_id, callback.from_user.id)
     await callback.answer("Готово" if ok else "Ошибка", show_alert=not ok)
     if not ok:
         return
 
-    await callback.message.edit_reply_markup(reply_markup=None)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        log.exception("Failed to remove card payment owner buttons")
+
     await callback.message.answer(f"✅ {result_text}")
     if telegram_id:
         try:
@@ -1552,7 +1719,7 @@ async def card_approve(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("card_reject_"))
 async def card_reject(callback: CallbackQuery) -> None:
-    if callback.from_user.id != ADMIN_ID:
+    if not is_owner(callback.from_user.id):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return
     try:
@@ -1562,27 +1729,46 @@ async def card_reject(callback: CallbackQuery) -> None:
         return
 
     async with SessionLocal() as session:
-        payment = await session.get(Payment, payment_id)
+        result = await session.execute(
+            select(Payment).where(Payment.id == payment_id).with_for_update()
+        )
+        payment = result.scalar_one_or_none()
         if payment is None or payment.method != "Uzcard/Humo":
             await callback.answer("Платёж не найден.", show_alert=True)
             return
-        if payment.status != "pending":
-            await callback.answer("Платёж уже обработан.", show_alert=True)
+
+        if payment.status == "paid":
+            await callback.answer("Платёж уже подтверждён.", show_alert=True)
             return
+        if payment.status == "rejected":
+            await callback.answer("Платёж уже отклонён.", show_alert=True)
+            return
+        if payment.status != "pending":
+            await callback.answer(f"Платёж имеет статус: {payment.status}.", show_alert=True)
+            return
+
+        now = utc_now()
         payment.status = "rejected"
+        payment.confirmed_by = callback.from_user.id
+        payment.confirmed_at = now
         await session.commit()
+
         user = await session.get(User, payment.user_id)
         telegram_id = user.telegram_id if user else None
 
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        log.exception("Failed to remove rejected payment buttons")
     await callback.answer("Отклонено")
-    await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer("❌ Платёж отмечен как не поступивший.")
+
     if telegram_id:
         try:
             await bot.send_message(
                 telegram_id,
                 "<b>❌ Оплата пока не подтверждена</b>\n\n"
-                "Администратор не подтвердил поступление средств. Если деньги уже списались, обратитесь в поддержку и приложите чек.",
+                "Владелец не подтвердил поступление средств. Если проблема сохраняется, обратитесь в поддержку.",
                 reply_markup=home_kb(telegram_id),
             )
         except Exception:
@@ -1721,8 +1907,8 @@ async def news(callback: CallbackQuery) -> None:
 # ----------------------------- Support -----------------------------
 
 @dp.callback_query(F.data.startswith("support_"))
-async def support_topic(callback: CallbackQuery) -> None:
-    topic = callback.data.replace("support_", "")
+async def support_topic(callback: CallbackQuery, state: FSMContext) -> None:
+    topic = callback.data.replace("support_", "", 1)
     titles = {
         "connect": "🔑 Не подключается VPN",
         "payment": "💳 Проблема с оплатой",
@@ -1731,21 +1917,77 @@ async def support_topic(callback: CallbackQuery) -> None:
     }
     title = titles.get(topic, "Поддержка")
 
-    if topic == "operator":
-        text = (
-            "<b>💬 Оператор</b>\n\n"
-            "В рабочей версии здесь будет кнопка для обращения "
-            "в поддержку или пересылка сообщения администратору."
-        )
-    else:
-        text = (
-            f"<b>{title}</b>\n\n"
-            "Опишите проблему одним сообщением.\n"
-            "В рабочей версии обращение будет сохранено в БД "
-            "и передано оператору."
+    await state.set_state(UserStates.support_message)
+    await state.update_data(support_topic=topic)
+    await callback.message.answer(
+        f"<b>{title}</b>\n\n"
+        "Опишите проблему одним сообщением — обращение будет передано оператору поддержки.\n\n"
+        "⚠️ Не отправляйте чек, номер карты, сумму платежа, пароли или токены.\n"
+        "Для отмены: <code>ОТМЕНА</code>"
+    )
+    await callback.answer()
+
+
+@dp.message(UserStates.support_message)
+async def support_message_received(message: Message, state: FSMContext) -> None:
+    if message.text and message.text.strip().upper() == "ОТМЕНА":
+        await state.clear()
+        return await message.answer("Обращение отменено.", reply_markup=home_kb(message.from_user.id))
+
+    if message.photo or message.document or message.video or message.voice or message.audio:
+        return await message.answer(
+            "❗ Для поддержки отправьте текстовое описание проблемы.\n"
+            "Чеки и платёжные документы через поддержку не пересылаются."
         )
 
-    await edit_screen(callback, key="support", text=text, keyboard=back_kb("support"))
+    if ADMIN_ID <= 0:
+        await state.clear()
+        return await message.answer(
+            "⚠️ Оператор поддержки пока не настроен. Попробуйте позже.",
+            reply_markup=home_kb(message.from_user.id),
+        )
+
+    data = await state.get_data()
+    topic = data.get("support_topic", "operator")
+    topic_names = {
+        "connect": "Не подключается VPN",
+        "payment": "Проблема с оплатой",
+        "device": "Проблема с устройством",
+        "operator": "Общее обращение",
+    }
+    topic_name = topic_names.get(topic, "Общее обращение")
+
+    raw_text = (message.text or message.caption or "").strip()
+    # Do not pass financial/card data to the support operator.
+    import re
+    sanitized = re.sub(r"(?<!\d)\d[\d\s-]{10,18}\d(?!\d)", "[ДАННЫЕ СКРЫТЫ]", raw_text)
+    sanitized = re.sub(r"(?i)(?:\$|USD|UZS|сум)\s*[\d.,]+", "[СУММА СКРЫТА]", sanitized)
+    sanitized = re.sub(r"(?i)[\d.,]+\s*(?:\$|USD|UZS|сум)", "[СУММА СКРЫТА]", sanitized)
+    sanitized = sanitized[:3500] if sanitized else "Пользователь отправил пустое сообщение."
+
+    username = f"@{message.from_user.username}" if message.from_user.username else "нет username"
+    operator_text = (
+        "<b>🛠 Новое обращение в поддержку</b>\n\n"
+        f"📌 Тема: <b>{topic_name}</b>\n"
+        f"👤 ID: <code>{message.from_user.id}</code>\n"
+        f"👤 Username: <b>{username}</b>\n\n"
+        f"<b>Сообщение:</b>\n{sanitized}"
+    )
+
+    try:
+        await bot.send_message(ADMIN_ID, operator_text)
+    except Exception:
+        log.exception("Failed to send support request to ADMIN_ID")
+        return await message.answer(
+            "⚠️ Не удалось передать обращение оператору. Попробуйте ещё раз.",
+        )
+
+    await state.clear()
+    await message.answer(
+        "✅ Обращение передано оператору поддержки.\n"
+        "Ожидайте ответа.",
+        reply_markup=home_kb(message.from_user.id),
+    )
 
 
 # ----------------------------- Admin panel -----------------------------
@@ -1754,20 +1996,20 @@ async def support_topic(callback: CallbackQuery) -> None:
 async def admin_panel(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
 
-    if not is_admin(callback.from_user.id):
+    if not is_owner(callback.from_user.id):
         return await callback.answer("Нет доступа.", show_alert=True)
 
     await edit_screen(
         callback,
         key="support",
-        text="<b>👑 Админ-панель</b>\n\nВыберите раздел:",
+        text="<b>👑 Панель владельца</b>\n\nВыберите раздел:",
         keyboard=admin_kb(),
     )
 
 
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
+    if not is_owner(callback.from_user.id):
         return await callback.answer("Нет доступа.", show_alert=True)
 
     await mark_expired_subscriptions()
@@ -1784,24 +2026,69 @@ async def admin_stats(callback: CallbackQuery) -> None:
         )
         active_subscriptions = active_result.scalar() or 0
 
-        revenue_result = await session.execute(
-            select(func.coalesce(func.sum(Payment.amount), 0)).where(
-                Payment.status == "paid"
+        uzs_paid_count = await session.execute(
+            select(func.count(Payment.id)).where(
+                Payment.status == "paid",
+                Payment.method == "Uzcard/Humo",
+                Payment.currency == "UZS",
             )
         )
-        revenue = revenue_result.scalar() or 0
+        uzs_paid_count = uzs_paid_count.scalar() or 0
 
-        paid_result = await session.execute(
-            select(func.count(Payment.id)).where(Payment.status == "paid")
+        uzs_paid_sum = await session.execute(
+            select(func.coalesce(func.sum(Payment.uzs_amount), 0)).where(
+                Payment.status == "paid",
+                Payment.method == "Uzcard/Humo",
+                Payment.currency == "UZS",
+            )
         )
-        paid_payments = paid_result.scalar() or 0
+        uzs_paid_sum = uzs_paid_sum.scalar() or Decimal("0")
+
+        uzs_pending_count = await session.execute(
+            select(func.count(Payment.id)).where(
+                Payment.status == "pending",
+                Payment.method == "Uzcard/Humo",
+                Payment.currency == "UZS",
+            )
+        )
+        uzs_pending_count = uzs_pending_count.scalar() or 0
+
+        ton_paid_count = await session.execute(
+            select(func.count(Payment.id)).where(
+                Payment.status == "paid",
+                Payment.method == "TON",
+            )
+        )
+        ton_paid_count = ton_paid_count.scalar() or 0
+
+        ton_paid_sum = await session.execute(
+            select(func.coalesce(func.sum(Payment.crypto_amount), 0)).where(
+                Payment.status == "paid",
+                Payment.method == "TON",
+            )
+        )
+        ton_paid_sum = ton_paid_sum.scalar() or Decimal("0")
+
+        ton_pending_count = await session.execute(
+            select(func.count(Payment.id)).where(
+                Payment.status == "pending",
+                Payment.method == "TON",
+            )
+        )
+        ton_pending_count = ton_pending_count.scalar() or 0
 
     text = (
-        "<b>📊 Статистика и аналитика</b>\n\n"
+        "<b>📊 Финансовая статистика владельца</b>\n\n"
         f"👥 Пользователей: <b>{total_users}</b>\n"
-        f"🟢 Активных подписок: <b>{active_subscriptions}</b>\n"
-        f"💰 Оплачено: <b>{revenue} сум</b>\n"
-        f"💳 Успешных платежей: <b>{paid_payments}</b>"
+        f"🟢 Активных подписок: <b>{active_subscriptions}</b>\n\n"
+        "<b>💳 UZCARD / HUMO</b>\n"
+        f"✅ Подтверждено: <b>{uzs_paid_count}</b>\n"
+        f"💰 Сумма: <b>{uzs_paid_sum:.0f} UZS</b>\n"
+        f"⏳ Ожидают: <b>{uzs_pending_count}</b>\n\n"
+        "<b>💎 TON</b>\n"
+        f"✅ Подтверждено: <b>{ton_paid_count}</b>\n"
+        f"💎 Сумма: <b>{format_ton(ton_paid_sum)} TON</b>\n"
+        f"⏳ Ожидают: <b>{ton_pending_count}</b>"
     )
 
     await edit_screen(callback, key="support", text=text, keyboard=admin_kb())
@@ -1809,7 +2096,7 @@ async def admin_stats(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "admin_users")
 async def admin_users(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
+    if not is_owner(callback.from_user.id):
         return await callback.answer("Нет доступа.", show_alert=True)
 
     await state.set_state(AdminStates.search)
@@ -1823,7 +2110,7 @@ async def admin_users(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(AdminStates.search)
 async def admin_search(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return
 
@@ -1903,7 +2190,7 @@ async def admin_search(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data.startswith("admin_user_days:"))
 async def admin_user_days(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
+    if not is_owner(callback.from_user.id):
         return await callback.answer("Нет доступа.", show_alert=True)
 
     telegram_id = callback.data.split(":", 1)[1]
@@ -1922,7 +2209,7 @@ async def admin_user_days(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data.startswith("admin_user_access:"))
 async def admin_user_access(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
+    if not is_owner(callback.from_user.id):
         return await callback.answer("Нет доступа.", show_alert=True)
 
     telegram_id = callback.data.split(":", 1)[1]
@@ -1941,7 +2228,7 @@ async def admin_user_access(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "admin_bonus")
 async def admin_bonus(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
+    if not is_owner(callback.from_user.id):
         return await callback.answer("Нет доступа.", show_alert=True)
 
     await state.set_state(AdminStates.bonus_user)
@@ -1955,7 +2242,7 @@ async def admin_bonus(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(AdminStates.bonus_user)
 async def admin_bonus_user(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return
 
@@ -1988,7 +2275,7 @@ async def admin_bonus_user(message: Message, state: FSMContext) -> None:
 
 @dp.message(AdminStates.bonus_days)
 async def admin_bonus_days(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return
 
@@ -2034,7 +2321,7 @@ async def admin_bonus_days(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
+    if not is_owner(callback.from_user.id):
         return await callback.answer("Нет доступа.", show_alert=True)
 
     await state.set_state(AdminStates.broadcast)
@@ -2049,7 +2336,7 @@ async def admin_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(AdminStates.broadcast)
 async def admin_broadcast_message(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return
 
@@ -2089,7 +2376,7 @@ async def admin_broadcast_message(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "admin_promo")
 async def admin_promo(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
+    if not is_owner(callback.from_user.id):
         return await callback.answer("Нет доступа.", show_alert=True)
 
     await state.set_state(AdminStates.promo_code)
@@ -2104,7 +2391,7 @@ async def admin_promo(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(AdminStates.promo_code)
 async def admin_promo_code(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return
 
@@ -2141,7 +2428,7 @@ async def admin_promo_code(message: Message, state: FSMContext) -> None:
 
 @dp.message(AdminStates.promo_days)
 async def admin_promo_days(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return
 
@@ -2171,7 +2458,7 @@ async def admin_promo_days(message: Message, state: FSMContext) -> None:
 
 @dp.message(AdminStates.promo_uses)
 async def admin_promo_uses(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return
 
@@ -2276,14 +2563,17 @@ async def main() -> None:
     await init_db()
     await ensure_payment_schema()
     await refresh_ton_price(force=True)
+    await refresh_usd_uzs_rate(force=True)
     ton_task = asyncio.create_task(ton_price_loop())
+    cbu_task = asyncio.create_task(usd_uzs_rate_loop())
 
     log.info("VPN bot started")
     try:
         await dp.start_polling(bot)
     finally:
         ton_task.cancel()
-        await asyncio.gather(ton_task, return_exceptions=True)
+        cbu_task.cancel()
+        await asyncio.gather(ton_task, cbu_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
