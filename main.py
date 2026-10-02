@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import ssl
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from decimal import Decimal
@@ -14,6 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, func, select
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -136,8 +138,26 @@ class PromoRedemption(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+# asyncpg does not accept libpq-style ``sslmode`` as a direct connection
+# keyword. Neon commonly puts ``sslmode=require`` (and sometimes
+# ``channel_binding=require``) into DATABASE_URL. Remove those URL options
+# before SQLAlchemy passes the connection arguments to asyncpg, and enable
+# TLS explicitly with an SSL context instead.
+db_url = make_url(DATABASE_URL)
+db_query = dict(db_url.query)
+sslmode = str(db_query.get("sslmode", "")).lower()
+
+if "sslmode" in db_query or "channel_binding" in db_query:
+    db_url = db_url.difference_update_query(["sslmode", "channel_binding"])
+
+connect_args = {}
+
+if sslmode in {"require", "verify-ca", "verify-full"} or "channel_binding" in DATABASE_URL:
+    connect_args["ssl"] = ssl.create_default_context()
+
 engine = create_async_engine(
-    DATABASE_URL,
+    db_url,
+    connect_args=connect_args,
     pool_pre_ping=True,
     pool_recycle=1800,
 )
