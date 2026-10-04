@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import os
+import uuid
 from dotenv import load_dotenv
 load_dotenv()
 import ssl
@@ -25,8 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # ============================================================
-# Telegram VPN bot — UI/logic skeleton
-# VPN API and payments are intentionally separated from the menu.
+# Telegram VPN bot — production VLESS/Xray integration
 # PostgreSQL/Neon is used for users, subscriptions, payments and promo codes.
 # ============================================================
 
@@ -43,6 +44,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+# ----------------------------- Xray / VLESS configuration -----------------------------
+# The bot manages one production server for now: USA.
+# Defaults match the Xray instance configured on the VPS.
+XRAY_HOST = os.getenv("XRAY_HOST", "45.61.170.239").strip()
+XRAY_PORT = int(os.getenv("XRAY_PORT", "443") or 443)
+XRAY_CONFIG_PATH = Path(os.getenv("XRAY_CONFIG_PATH", "/usr/local/etc/xray/config.json"))
+XRAY_BINARY = os.getenv("XRAY_BINARY", "/usr/local/bin/xray").strip()
+XRAY_SERVICE = os.getenv("XRAY_SERVICE", "xray.service").strip()
+XRAY_SYNC_INTERVAL_SECONDS = 60
+XRAY_SERVER_NAME = "🇺🇸 США"
+XRAY_CONFIG_LOCK = asyncio.Lock()
+XRAY_LAST_SIGNATURE: str | None = None
 
 # ----------------------------- TON payment configuration -----------------------------
 TON_WALLET_ADDRESS = os.getenv(
@@ -140,6 +154,28 @@ class Subscription(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class VpnAccess(Base):
+    __tablename__ = "vpn_access"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    client_uuid: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    server: Mapped[str] = mapped_column(String(32), default="us", nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -636,6 +672,173 @@ async def confirm_ton_payment(payment_id: int, telegram_id: int) -> tuple[bool, 
 
         await session.commit()
         return True, "✅ Оплата подтверждена! Подписка активирована."
+
+
+# ----------------------------- Xray / VLESS helpers -----------------------------
+
+async def _run_xray_test(config_path: Path) -> tuple[bool, str]:
+    """Validate an Xray config before replacing the live configuration."""
+    process = await asyncio.create_subprocess_exec(
+        XRAY_BINARY,
+        "run",
+        "-test",
+        "-config",
+        str(config_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    output = (stdout + stderr).decode("utf-8", errors="replace").strip()
+    return process.returncode == 0, output
+
+
+async def _restart_xray() -> None:
+    """Restart the systemd-managed Xray service after a valid config update."""
+    process = await asyncio.create_subprocess_exec(
+        "systemctl", "restart", XRAY_SERVICE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        output = (stdout + stderr).decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Не удалось перезапустить Xray: {output[-1000:]}")
+
+
+async def sync_xray_clients(force: bool = False) -> bool:
+    """Synchronize active paid/trial subscriptions with Xray clients.
+
+    Every user keeps one stable UUID. Expired subscriptions are removed from
+    the live Xray config automatically, while renewal re-enables the same UUID.
+    The config is restarted only when the active client set changes.
+    """
+    global XRAY_LAST_SIGNATURE
+
+    async with XRAY_CONFIG_LOCK:
+        now = utc_now()
+
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(User, Subscription)
+                .join(Subscription, Subscription.user_id == User.id)
+                .where(
+                    Subscription.status == "active",
+                    Subscription.expires_at > now,
+                )
+                .order_by(User.id, Subscription.expires_at.desc())
+            )
+            pairs = result.all()
+
+            # One active subscription per user is the intended model. If old
+            # duplicate rows exist, keep the latest expiry only.
+            active_users: dict[int, tuple[User, Subscription]] = {}
+            for user, subscription in pairs:
+                current = active_users.get(user.id)
+                if current is None or subscription.expires_at > current[1].expires_at:
+                    active_users[user.id] = (user, subscription)
+
+            for user, _subscription in active_users.values():
+                access = await session.scalar(
+                    select(VpnAccess).where(VpnAccess.user_id == user.id)
+                )
+                if access is None:
+                    session.add(
+                        VpnAccess(
+                            user_id=user.id,
+                            client_uuid=str(uuid.uuid4()),
+                            server="us",
+                            enabled=True,
+                        )
+                    )
+
+            await session.commit()
+
+            access_result = await session.execute(
+                select(VpnAccess, User)
+                .join(User, User.id == VpnAccess.user_id)
+                .where(
+                    VpnAccess.enabled.is_(True),
+                    VpnAccess.server == "us",
+                    User.id.in_(list(active_users.keys())) if active_users else text("FALSE"),
+                )
+                .order_by(User.id)
+            )
+            active_access = access_result.all()
+
+        clients = [
+            {
+                "id": access.client_uuid,
+                "email": f"tg-{user.telegram_id}@anubsusvpn",
+            }
+            for access, user in active_access
+        ]
+
+        signature = json.dumps(
+            [(client["id"], client["email"]) for client in clients],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if not force and signature == XRAY_LAST_SIGNATURE:
+            return False
+
+        config = {
+            "log": {"loglevel": "warning"},
+            "inbounds": [
+                {
+                    "listen": "0.0.0.0",
+                    "port": XRAY_PORT,
+                    "protocol": "vless",
+                    "settings": {
+                        "clients": clients,
+                        "decryption": "none",
+                    },
+                    "streamSettings": {"network": "tcp"},
+                    "tag": "vless-in",
+                }
+            ],
+            "outbounds": [
+                {"protocol": "freedom", "tag": "direct"},
+            ],
+        }
+
+        XRAY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = XRAY_CONFIG_PATH.with_suffix(".json.tmp")
+        temp_path.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        ok, output = await _run_xray_test(temp_path)
+        if not ok:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise RuntimeError(f"Xray config validation failed: {output[-2000:]}")
+
+        temp_path.replace(XRAY_CONFIG_PATH)
+        await _restart_xray()
+        XRAY_LAST_SIGNATURE = signature
+        log.info("Xray synchronized: %s active client(s)", len(clients))
+        return True
+
+
+def build_vless_url(client_uuid: str) -> str:
+    return (
+        f"vless://{client_uuid}@{XRAY_HOST}:{XRAY_PORT}"
+        "?type=tcp&security=none&encryption=none#AnubsusVPN-USA"
+    )
+
+
+async def xray_sync_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(XRAY_SYNC_INTERVAL_SECONDS)
+            await sync_xray_clients()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Xray synchronization loop failed")
 
 
 # ----------------------------- UI assets -----------------------------
@@ -1147,11 +1350,10 @@ VPN_TEXT = """
 
 {status}
 
-Здесь можно получить доступ, посмотреть устройства,
-выбрать сервер или открыть инструкцию по подключению.
+🇺🇸 Сервер: <b>США</b>
+🟢 Статус: <b>Активен</b>
 
-<i>Сейчас работает демонстрационный режим.
-Реальный VPN API подключим следующим этапом.</i>
+Получите персональный ключ и вставьте его в v2RayTun.
 """
 
 TARIFFS_TEXT = """
@@ -1192,26 +1394,23 @@ HELP_TEXT = """
 <b>📚 Помощь</b>
 
 <b>Как подключиться?</b>
-1. Откройте «Мой VPN».
-2. Получите доступ.
-3. Выберите сервер.
-4. Установите приложение по инструкции.
-5. Импортируйте конфигурацию.
+1. Откройте App Store или Play Market.
+2. Найдите приложение <b>v2RayTun</b> и скачайте его.
+3. Получите у бота свой ключ.
+4. Вставьте ключ в приложение.
+5. Включите VPN и пользуйтесь.
 
-Если что-то не работает — откройте «Поддержка».
+Если что-то непонятно — обращайтесь в поддержку,
+наш сотрудник обязательно поможет вам.
 """
 
 SERVERS_TEXT = """
 <b>🌍 Серверы</b>
 
-Доступные направления:
+🇺🇸 <b>США — Активен</b>
+🟢 Статус: <b>Активен</b>
 
-🇩🇪 Германия — подготовка
-🇳🇱 Нидерланды — подготовка
-🇫🇮 Финляндия — подготовка
-
-После подключения реального VPN API статус
-серверов будет показываться автоматически.
+Сейчас для подключения доступен один сервер — США.
 """
 
 REFERRAL_TEXT = """
@@ -1241,14 +1440,14 @@ PROXY_TEXT = """
 INSTRUCTIONS_TEXT = """
 <b>📖 Подключение VPN</b>
 
-1️⃣ Установите поддерживаемое VPN-приложение.
-2️⃣ Получите конфигурацию в разделе «Мой VPN».
-3️⃣ Импортируйте её в приложение.
-4️⃣ Включите соединение.
-5️⃣ Проверьте статус.
+1️⃣ Откройте App Store или Play Market.
+2️⃣ Найдите приложение <b>v2RayTun</b> и скачайте его.
+3️⃣ Получите у бота свой ключ.
+4️⃣ Вставьте ключ в приложении.
+5️⃣ Включите VPN и пользуйтесь.
 
-После подключения VPN API сюда можно добавить
-автоматическую выдачу конфигурации.
+Если что-то непонятно — обращайтесь в поддержку,
+наш сотрудник обязательно поможет вам.
 """
 
 
@@ -1326,25 +1525,20 @@ async def help_screen(callback: CallbackQuery) -> None:
 async def servers(callback: CallbackQuery) -> None:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🇩🇪 Германия", callback_data="server_de")],
-            [InlineKeyboardButton(text="🇳🇱 Нидерланды", callback_data="server_nl")],
-            [InlineKeyboardButton(text="🇫🇮 Финляндия", callback_data="server_fi")],
+            [InlineKeyboardButton(text="🇺🇸 США — 🟢 Активен", callback_data="server_us")],
             [InlineKeyboardButton(text="↩️ В меню", callback_data="home")],
         ]
     )
     await edit_screen(callback, key="vpn", text=SERVERS_TEXT, keyboard=kb)
 
 
-@dp.callback_query(F.data.startswith("server_"))
+@dp.callback_query(F.data == "server_us")
 async def server_selected(callback: CallbackQuery) -> None:
-    code = callback.data.split("_", 1)[1]
-    names = {"de": "🇩🇪 Германия", "nl": "🇳🇱 Нидерланды", "fi": "🇫🇮 Финляндия"}
-    name = names.get(code, "Неизвестный сервер")
     text = (
-        f"<b>{name}</b>\n\n"
-        "🟡 Сервер пока не подключён к VPN API.\n\n"
-        "Когда инфраструктура будет готова, здесь будут "
-        "реальный статус, нагрузка, пинг и кнопка выбора."
+        "<b>🇺🇸 США</b>\n\n"
+        "🟢 Статус: <b>Активен</b>\n"
+        "🌐 Протокол: <b>VLESS</b>\n\n"
+        "Этот сервер используется для выдачи VPN-доступа."
     )
     await edit_screen(callback, key="vpn", text=text, keyboard=back_kb("servers"))
 
@@ -1455,17 +1649,76 @@ async def trial(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "get_access")
 async def get_access(callback: CallbackQuery) -> None:
-    await edit_screen(
-        callback,
-        key="vpn",
-        text=(
-            "<b>🔐 Получение доступа</b>\n\n"
-            "Сейчас VPN API ещё не подключён.\n\n"
-            "На следующем этапе эта кнопка будет создавать "
-            "персональный VPN-доступ и отправлять конфигурацию пользователю."
-        ),
-        keyboard=back_kb("vpn"),
+    await ensure_user(callback.from_user)
+
+    async with SessionLocal() as session:
+        user = await get_user(session, callback.from_user.id)
+        if user is None:
+            await callback.answer("Пользователь не найден.", show_alert=True)
+            return
+
+        subscription = await get_active_subscription(session, user.id)
+        if subscription is None:
+            await edit_screen(
+                callback,
+                key="vpn",
+                text=(
+                    "<b>🔐 Получение доступа</b>\n\n"
+                    "🔴 У вас нет активной подписки.\n\n"
+                    "Сначала выберите тариф и оплатите подписку."
+                ),
+                keyboard=back_kb("tariffs"),
+            )
+            return
+
+        access = await session.scalar(
+            select(VpnAccess).where(VpnAccess.user_id == user.id)
+        )
+        if access is None:
+            access = VpnAccess(
+                user_id=user.id,
+                client_uuid=str(uuid.uuid4()),
+                server="us",
+                enabled=True,
+            )
+            session.add(access)
+            await session.commit()
+            await session.refresh(access)
+        client_uuid = access.client_uuid
+
+    try:
+        await sync_xray_clients()
+    except Exception:
+        log.exception("Failed to synchronize Xray for user %s", callback.from_user.id)
+        await edit_screen(
+            callback,
+            key="vpn",
+            text=(
+                "<b>⚠️ Не удалось подготовить VPN-доступ</b>\n\n"
+                "Попробуйте ещё раз через несколько секунд. Если ошибка повторяется, "
+                "обратитесь в поддержку."
+            ),
+            keyboard=back_kb("vpn"),
+        )
+        return
+
+    vless_url = build_vless_url(client_uuid)
+    text = (
+        "<b>🔐 Ваш VPN-доступ готов</b>\n\n"
+        "🇺🇸 Сервер: <b>США</b>\n"
+        "🟢 Статус: <b>Активен</b>\n\n"
+        "<b>Ваш ключ:</b>\n"
+        f"<code>{vless_url}</code>\n\n"
+        "<b>Как подключиться:</b>\n"
+        "1️⃣ Откройте App Store или Play Market.\n"
+        "2️⃣ Найдите <b>v2RayTun</b> и скачайте его.\n"
+        "3️⃣ Скопируйте ключ выше.\n"
+        "4️⃣ Вставьте ключ в приложении.\n"
+        "5️⃣ Включите VPN и пользуйтесь.\n\n"
+        "Если что-то непонятно — обращайтесь в поддержку, "
+        "наш сотрудник обязательно поможет вам."
     )
+    await edit_screen(callback, key="vpn", text=text, keyboard=back_kb("vpn"))
 
 
 @dp.callback_query(F.data == "renew")
@@ -2704,6 +2957,13 @@ async def main() -> None:
     await refresh_usd_uzs_rate(force=True)
     ton_task = asyncio.create_task(ton_price_loop())
     cbu_task = asyncio.create_task(usd_uzs_rate_loop())
+    xray_task = asyncio.create_task(xray_sync_loop())
+
+    # Build the live Xray client list immediately on startup.
+    try:
+        await sync_xray_clients(force=True)
+    except Exception:
+        log.exception("Initial Xray synchronization failed")
 
     log.info("VPN bot started")
     try:
@@ -2711,7 +2971,8 @@ async def main() -> None:
     finally:
         ton_task.cancel()
         cbu_task.cancel()
-        await asyncio.gather(ton_task, cbu_task, return_exceptions=True)
+        xray_task.cancel()
+        await asyncio.gather(ton_task, cbu_task, xray_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
