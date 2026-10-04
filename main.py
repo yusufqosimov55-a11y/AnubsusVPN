@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import ssl
 import secrets
 from datetime import datetime, timezone, timedelta
