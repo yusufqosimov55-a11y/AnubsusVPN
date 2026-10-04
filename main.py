@@ -68,6 +68,8 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "").strip()
 # Manual bank-card payment details. Put your public payment details in Render.
 # Do NOT put secret banking credentials or passwords here.
 CARD_PAYMENT_DETAILS = os.getenv("CARD_PAYMENT_DETAILS", "5614 6812 5331 8145").strip()
+# Separate Visa payment details. Configure this in .env on the server.
+VISA_PAYMENT_DETAILS = os.getenv("VISA_PAYMENT_DETAILS", "").strip()
 NEWS_CHANNEL_URL = "https://t.me/AnobsusVPN_NEWS"
 REFERRAL_REWARD_HOURS = 3
 REFERRAL_NEW_USER_WINDOW_SECONDS = 15 * 60
@@ -1227,6 +1229,7 @@ def payment_methods_kb(days: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="💎 TON", callback_data=f"pay_ton_{days}")],
             [InlineKeyboardButton(text="💳 Uzcard / Humo", callback_data=f"pay_card_{days}")],
+            [InlineKeyboardButton(text="💳 Visa", callback_data=f"pay_visa_{days}")],
             [InlineKeyboardButton(text="↩️ Назад к тарифам", callback_data="tariffs")],
         ]
     )
@@ -1278,6 +1281,7 @@ def admin_kb() -> InlineKeyboardMarkup:
 class UserStates(StatesGroup):
     promo = State()
     card_receipt = State()
+    visa_receipt = State()
     support_message = State()
 
 
@@ -1872,6 +1876,374 @@ async def pay_card(callback: CallbackQuery) -> None:
     await edit_screen(callback, key="tariffs", text=text, keyboard=keyboard)
 
 
+
+@dp.callback_query(F.data.startswith("pay_visa_"))
+async def pay_visa(callback: CallbackQuery) -> None:
+    try:
+        days = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный тариф", show_alert=True)
+        return
+
+    price_usd = tariff_price_usd(days)
+    if price_usd is None:
+        await callback.answer("Неизвестный тариф", show_alert=True)
+        return
+
+    if not VISA_PAYMENT_DETAILS:
+        await callback.answer("Реквизиты Visa ещё не настроены владельцем.", show_alert=True)
+        return
+
+    rate = await refresh_usd_uzs_rate()
+    if rate is None:
+        await callback.answer(
+            "Не удалось получить курс ЦБ. Попробуйте ещё раз через несколько секунд.",
+            show_alert=True,
+        )
+        return
+
+    # Same pricing flow as Uzcard/Humo: lock the UZS amount at order creation.
+    uzs_amount = (price_usd * rate).quantize(Decimal("1"))
+    order_id = "VISA-" + secrets.token_hex(5).upper()
+    expires_at = utc_now() + timedelta(minutes=30)
+
+    async with SessionLocal() as session:
+        user = await get_user(session, callback.from_user.id)
+        if user is None:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+
+        payment = Payment(
+            user_id=user.id,
+            amount=price_usd,
+            usd_amount=price_usd,
+            exchange_rate=rate,
+            uzs_amount=uzs_amount,
+            currency="UZS",
+            method="Visa",
+            provider="Manual Visa verification",
+            order_id=order_id,
+            tariff_days=days,
+            status="pending",
+            expires_at=expires_at,
+        )
+        session.add(payment)
+        await session.commit()
+        await session.refresh(payment)
+
+    expires_text = expires_at.strftime("%H:%M:%S")
+    text = (
+        "<b>💳 ОПЛАТА VISA</b>\n\n"
+        f"Тариф: <b>{days} дней</b>\n"
+        f"Цена тарифа: <b>${price_usd:.2f}</b>\n"
+        f"Курс ЦБ: <b>1 USD = {rate:.2f} UZS</b>\n"
+        f"К оплате: <b>{uzs_amount:.0f} UZS</b>\n"
+        f"🆔 Заказ: <code>{order_id}</code>\n"
+        f"⏱ Оплатить до: <b>{expires_text}</b>\n\n"
+        "<b>💳 РЕКВИЗИТЫ VISA:</b>\n"
+        f"<pre>{VISA_PAYMENT_DETAILS}</pre>\n\n"
+        "<b>⚠️ ДЕНЬГИ ПОСТУПЯТ ТОЛЬКО ПОСЛЕ ПРОВЕРКИ ВЛАДЕЛЬЦЕМ.</b>\n"
+        "<b>📎 ЧЕК ОБЯЗАТЕЛЕН.</b>\n"
+        "<b>❗ БЕЗ ЧЕКА ПЛАТЁЖ МОЖЕТ БЫТЬ НЕ ЗАСЧИТАН.</b>\n"
+        "<b>❗ ЕСЛИ ЗАКАЗ ИСТЕЧЁТ, СОЗДАЙТЕ НОВЫЙ ЗАКАЗ.</b>\n\n"
+        "После перевода нажмите кнопку ниже и отправьте фото/скриншот или документ с чеком.\n"
+        "Владелец проверит поступление денег и после подтверждения выдаст подписку."
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📎 Я оплатил — отправить чек", callback_data=f"visa_receipt_{payment.id}")],
+            [InlineKeyboardButton(text="↩️ Выбрать другой способ", callback_data=f"buy_{days}")],
+        ]
+    )
+    await edit_screen(callback, key="tariffs", text=text, keyboard=keyboard)
+
+
+@dp.callback_query(F.data.startswith("visa_receipt_"))
+async def visa_receipt_start(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        payment_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный заказ", show_alert=True)
+        return
+
+    async with SessionLocal() as session:
+        payment = await session.get(Payment, payment_id)
+        user = await get_user(session, callback.from_user.id)
+        if payment is None or user is None or payment.user_id != user.id or payment.method != "Visa":
+            await callback.answer("Заказ не найден", show_alert=True)
+            return
+        if payment.status != "pending":
+            await callback.answer("Этот заказ уже обработан или закрыт.", show_alert=True)
+            return
+        if payment.expires_at and payment.expires_at < utc_now():
+            payment.status = "expired"
+            await session.commit()
+            await callback.answer("Срок заказа истёк. Создайте новый заказ.", show_alert=True)
+            return
+
+    await state.set_state(UserStates.visa_receipt)
+    await state.update_data(visa_payment_id=payment_id)
+    await callback.message.answer(
+        "📎 <b>ОТПРАВЬТЕ ЧЕК ОБ ОПЛАТЕ VISA</b>\n\n"
+        "<b>ЧЕК ОБЯЗАТЕЛЕН — БЕЗ НЕГО ПЛАТЁЖ НЕ ПЕРЕДАЁТСЯ НА ПРОВЕРКУ.</b>\n\n"
+        "Отправьте фото/скриншот чека или документ.\n"
+        "После получения чек будет передан владельцу.\n"
+        "<b>ДЕНЬГИ ЗАСЧИТЫВАЮТСЯ ТОЛЬКО ПОСЛЕ РУЧНОЙ ПРОВЕРКИ ВЛАДЕЛЬЦЕМ.</b>\n\n"
+        "Если передумали — отправьте: <code>ОТМЕНА</code>"
+    )
+    await callback.answer()
+
+
+@dp.message(UserStates.visa_receipt)
+async def visa_receipt_received(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    payment_id = int(data.get("visa_payment_id", 0) or 0)
+
+    if message.text and message.text.strip().upper() == "ОТМЕНА":
+        await state.clear()
+        return await message.answer("❌ Отправка чека отменена.", reply_markup=home_kb(message.from_user.id))
+
+    if not message.photo and not message.document:
+        return await message.answer(
+            "❗ <b>ЧЕК ОБЯЗАТЕЛЕН.</b>\n\n"
+            "Отправьте именно фото/скриншот чека или документ.\n"
+            "Текст, голосовые и другие сообщения не принимаются как подтверждение оплаты."
+        )
+
+    async with SessionLocal() as session:
+        payment = await session.get(Payment, payment_id)
+        user = await get_user(session, message.from_user.id)
+        if payment is None or user is None or payment.user_id != user.id:
+            await state.clear()
+            return await message.answer("❌ Заказ не найден. Создайте новый заказ.", reply_markup=home_kb(message.from_user.id))
+        if payment.method != "Visa" or payment.status != "pending":
+            await state.clear()
+            return await message.answer("❌ Этот заказ уже обработан или закрыт.", reply_markup=home_kb(message.from_user.id))
+        if payment.expires_at and payment.expires_at < utc_now():
+            payment.status = "expired"
+            await session.commit()
+            await state.clear()
+            return await message.answer("⏱ Срок заказа истёк. Создайте новый заказ.", reply_markup=home_kb(message.from_user.id))
+
+        receipt_type = "photo" if message.photo else "document"
+        receipt_file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+
+        payment.receipt_chat_id = message.chat.id
+        payment.receipt_message_id = message.message_id
+        payment.receipt_file_id = receipt_file_id
+        payment.receipt_type = receipt_type
+        await session.commit()
+
+        username = f"@{user.username}" if user.username else "нет username"
+        rate_text = f"{payment.exchange_rate:.2f}" if payment.exchange_rate is not None else "—"
+        uzs_text = f"{payment.uzs_amount:.0f}" if payment.uzs_amount is not None else "—"
+        usd_text = f"{payment.usd_amount:.2f}" if payment.usd_amount is not None else f"{payment.amount:.2f}"
+        created_text = payment.created_at.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M:%S")
+
+        owner_text = (
+            "<b>💳 НОВЫЙ ПЛАТЁЖ VISA</b>\n\n"
+            f"🆔 Заказ: <code>{payment.order_id}</code>\n"
+            f"👤 Пользователь: <code>{user.telegram_id}</code> ({username})\n"
+            f"📦 Тариф: <b>{payment.tariff_days} дней</b>\n"
+            f"💵 USD: <b>${usd_text}</b>\n"
+            f"📈 Зафиксированный курс: <b>1 USD = {rate_text} UZS</b>\n"
+            f"💰 К оплате: <b>{uzs_text} UZS</b>\n"
+            "💳 Метод: <b>Visa</b>\n"
+            f"🕐 Создан: <b>{created_text} UTC</b>\n"
+            "📌 Статус: <b>pending</b>\n\n"
+            "Проверьте поступление средств и выберите действие."
+        )
+        owner_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Оплата получена", callback_data=f"visa_approve_{payment.id}"),
+                    InlineKeyboardButton(text="❌ Не поступила", callback_data=f"visa_reject_{payment.id}"),
+                ]
+            ]
+        )
+
+    if OWNER_ID <= 0:
+        await state.clear()
+        return await message.answer("⚠️ OWNER_ID не настроен. Обратитесь в поддержку.")
+
+    try:
+        await bot.send_message(OWNER_ID, owner_text, reply_markup=owner_keyboard)
+        await bot.copy_message(OWNER_ID, message.chat.id, message.message_id)
+    except Exception:
+        log.exception("Failed to send Visa receipt to owner")
+        return await message.answer("⚠️ Не удалось передать чек владельцу. Попробуйте отправить его ещё раз.")
+
+    await state.clear()
+    await message.answer(
+        "✅ Чек отправлен на проверку владельцу.\n\n"
+        "Ожидайте ручной проверки. После подтверждения подписка будет выдана автоматически.",
+        reply_markup=home_kb(message.from_user.id),
+    )
+
+
+async def approve_manual_visa_payment(payment_id: int, owner_id: int) -> tuple[bool, str, int | None]:
+    if not is_owner(owner_id):
+        return False, "Доступ запрещён.", None
+
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Payment).where(Payment.id == payment_id).with_for_update()
+        )
+        payment = result.scalar_one_or_none()
+        if payment is None or payment.method != "Visa":
+            return False, "Платёж не найден.", None
+
+        if payment.status == "paid":
+            user = await session.get(User, payment.user_id)
+            return True, "Платёж уже был подтверждён. Повторная выдача подписки не выполнялась.", user.telegram_id if user else None
+
+        if payment.status != "pending":
+            return False, f"Платёж имеет статус: {payment.status}.", None
+
+        if payment.expires_at and payment.expires_at < utc_now():
+            payment.status = "expired"
+            await session.commit()
+            return False, "Срок заказа истёк.", None
+
+        user = await session.get(User, payment.user_id)
+        if user is None:
+            return False, "Пользователь не найден.", None
+
+        now = utc_now()
+        days = int(payment.tariff_days or 0)
+        if days <= 0 or payment.uzs_amount is None or payment.exchange_rate is None or payment.usd_amount is None:
+            return False, "У платежа отсутствует сохранённая сумма заказа.", None
+
+        payment.status = "paid"
+        payment.paid_at = now
+        payment.confirmed_by = owner_id
+        payment.confirmed_at = now
+        payment.transaction_id = "MANUAL-VISA-" + secrets.token_hex(8).upper()
+
+        sub_result = await session.execute(
+            select(Subscription)
+            .where(
+                Subscription.user_id == user.id,
+                Subscription.status == "active",
+            )
+            .order_by(Subscription.expires_at.desc())
+            .limit(1)
+            .with_for_update()
+        )
+        subscription = sub_result.scalar_one_or_none()
+        if subscription and subscription.expires_at > now:
+            subscription.expires_at += timedelta(days=days)
+            subscription.updated_at = now
+        elif subscription:
+            subscription.expires_at = now + timedelta(days=days)
+            subscription.status = "active"
+            subscription.updated_at = now
+        else:
+            session.add(Subscription(
+                user_id=user.id,
+                expires_at=now + timedelta(days=days),
+                status="active",
+                created_at=now,
+                updated_at=now,
+            ))
+
+        await session.commit()
+        return True, f"Оплата Visa подтверждена. Выдано: {days} дней.", user.telegram_id
+
+
+@dp.callback_query(F.data.startswith("visa_approve_"))
+async def visa_approve(callback: CallbackQuery) -> None:
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    try:
+        payment_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный платёж.", show_alert=True)
+        return
+
+    ok, result_text, telegram_id = await approve_manual_visa_payment(payment_id, callback.from_user.id)
+    await callback.answer("Готово" if ok else "Ошибка", show_alert=not ok)
+    if not ok:
+        return
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        log.exception("Failed to remove Visa payment owner buttons")
+
+    await callback.message.answer(f"✅ {result_text}")
+    if telegram_id:
+        try:
+            await bot.send_message(
+                telegram_id,
+                "<b>✅ Оплата Visa подтверждена!</b>\n\n"
+                "Ваша подписка успешно активирована/продлена.\n"
+                "Откройте «Мой VPN», чтобы продолжить.",
+                reply_markup=home_kb(telegram_id),
+            )
+        except Exception:
+            log.exception("Failed to notify user about manual Visa payment")
+
+
+@dp.callback_query(F.data.startswith("visa_reject_"))
+async def visa_reject(callback: CallbackQuery) -> None:
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    try:
+        payment_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный платёж.", show_alert=True)
+        return
+
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Payment).where(Payment.id == payment_id).with_for_update()
+        )
+        payment = result.scalar_one_or_none()
+        if payment is None or payment.method != "Visa":
+            await callback.answer("Платёж не найден.", show_alert=True)
+            return
+
+        if payment.status == "paid":
+            await callback.answer("Платёж уже подтверждён.", show_alert=True)
+            return
+        if payment.status == "rejected":
+            await callback.answer("Платёж уже отклонён.", show_alert=True)
+            return
+        if payment.status != "pending":
+            await callback.answer(f"Платёж имеет статус: {payment.status}.", show_alert=True)
+            return
+
+        now = utc_now()
+        payment.status = "rejected"
+        payment.confirmed_by = callback.from_user.id
+        payment.confirmed_at = now
+        await session.commit()
+
+        user = await session.get(User, payment.user_id)
+        telegram_id = user.telegram_id if user else None
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        log.exception("Failed to remove rejected Visa payment buttons")
+    await callback.answer("Отклонено")
+    await callback.message.answer("❌ Платёж Visa отмечен как не поступивший.")
+
+    if telegram_id:
+        try:
+            await bot.send_message(
+                telegram_id,
+                "<b>❌ Оплата Visa пока не подтверждена</b>\n\n"
+                "Владелец не подтвердил поступление средств. Если проблема сохраняется, обратитесь в поддержку.",
+                reply_markup=home_kb(telegram_id),
+            )
+        except Exception:
+            log.exception("Failed to notify user about rejected manual Visa payment")
+
+
 @dp.callback_query(F.data.startswith("card_receipt_"))
 async def card_receipt_start(callback: CallbackQuery, state: FSMContext) -> None:
     try:
@@ -2444,6 +2816,33 @@ async def admin_stats(callback: CallbackQuery) -> None:
         )
         uzs_pending_count = uzs_pending_count.scalar() or 0
 
+        visa_paid_count = await session.execute(
+            select(func.count(Payment.id)).where(
+                Payment.status == "paid",
+                Payment.method == "Visa",
+                Payment.currency == "UZS",
+            )
+        )
+        visa_paid_count = visa_paid_count.scalar() or 0
+
+        visa_paid_sum = await session.execute(
+            select(func.coalesce(func.sum(Payment.uzs_amount), 0)).where(
+                Payment.status == "paid",
+                Payment.method == "Visa",
+                Payment.currency == "UZS",
+            )
+        )
+        visa_paid_sum = visa_paid_sum.scalar() or Decimal("0")
+
+        visa_pending_count = await session.execute(
+            select(func.count(Payment.id)).where(
+                Payment.status == "pending",
+                Payment.method == "Visa",
+                Payment.currency == "UZS",
+            )
+        )
+        visa_pending_count = visa_pending_count.scalar() or 0
+
         ton_paid_count = await session.execute(
             select(func.count(Payment.id)).where(
                 Payment.status == "paid",
@@ -2476,6 +2875,10 @@ async def admin_stats(callback: CallbackQuery) -> None:
         f"✅ Подтверждено: <b>{uzs_paid_count}</b>\n"
         f"💰 Сумма: <b>{uzs_paid_sum:.0f} UZS</b>\n"
         f"⏳ Ожидают: <b>{uzs_pending_count}</b>\n\n"
+        "<b>💳 VISA</b>\n"
+        f"✅ Подтверждено: <b>{visa_paid_count}</b>\n"
+        f"💰 Сумма: <b>{visa_paid_sum:.0f} UZS</b>\n"
+        f"⏳ Ожидают: <b>{visa_pending_count}</b>\n\n"
         "<b>💎 TON</b>\n"
         f"✅ Подтверждено: <b>{ton_paid_count}</b>\n"
         f"💎 Сумма: <b>{format_ton(ton_paid_sum)} TON</b>\n"
